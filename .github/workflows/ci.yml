@@ -1,0 +1,114 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  reference:
+    name: Reference implementation reproduces the vectors
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install cryptography jcs
+      # tap_ref.py regenerates test-vectors.json and self-checks. If the committed
+      # vectors differ from what the reference produces, the contract is broken.
+      - name: Regenerate and diff the conformance vectors
+        run: |
+          cp test-vectors.json /tmp/committed.json
+          python3 tap_ref.py
+          diff -u /tmp/committed.json test-vectors.json \
+            || { echo "::error::test-vectors.json is out of sync with tap_ref.py"; exit 1; }
+
+  python-sdk:
+    name: Python SDK
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ["3.10", "3.11", "3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - run: pip install cryptography jcs httpx
+      - name: Conformance
+        working-directory: sdk/python
+        run: PYTHONPATH=src python3 tests/test_conformance.py
+      - name: Verifier MUST-behaviours
+        working-directory: sdk/python
+        run: PYTHONPATH=src python3 tests/test_verifier_musts.py
+      - name: Anti-downgrade (nego) binding
+        working-directory: sdk/python
+        run: PYTHONPATH=src python3 tests/test_nego.py
+      - name: Policy engine
+        working-directory: sdk/python
+        run: PYTHONPATH=src python3 tests/test_policy.py
+      - name: Instance suffix
+        working-directory: sdk/python
+        run: PYTHONPATH=src python3 tests/test_instance_suffix.py
+      - name: Core imports without network dependencies
+        working-directory: sdk/python
+        run: PYTHONPATH=src python3 -c "import tap_sdk.core, tap_sdk.verify; print('ok')"
+
+  js-sdk:
+    name: TypeScript SDK
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        node-version: ["20", "22"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node-version }}
+      - working-directory: sdk/js
+        run: npm install
+      - name: Conformance + verifier MUSTs + unit tests
+        working-directory: sdk/js
+        run: npm test
+      - name: Type check / build
+        working-directory: sdk/js
+        run: npm run build
+
+  cross-language:
+    name: Python and TypeScript agree byte-for-byte
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - run: pip install cryptography jcs httpx
+      - working-directory: sdk/js
+        run: npm install
+      # Both SDKs verify against the same committed vectors; if either drifts,
+      # the Signer/Verifier interoperability guarantee is gone.
+      - name: Python against the vectors
+        working-directory: sdk/python
+        run: PYTHONPATH=src python3 tests/test_conformance.py
+      - name: TypeScript against the same vectors
+        working-directory: sdk/js
+        run: npx tsx test/conformance.ts
+      - name: Both cores enforce the same verifier MUSTs
+        run: |
+          (cd sdk/python && PYTHONPATH=src python3 tests/test_verifier_musts.py)
+          (cd sdk/js && npx tsx test/verifierMusts.test.ts)
+
+  secrets:
+    name: Secret scan
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

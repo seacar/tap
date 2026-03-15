@@ -1,0 +1,57 @@
+{
+  "name": "@traceableagent/sdk",
+  "version": "0.1.0",
+  "description": "Traceable Agent Protocol (TAP) SDKs \u2014 agent signing (@traceableagent/sdk/agent) and server attestation (@traceableagent/sdk/server).",
+  "license": "Apache-2.0",
+  "type": "module",
+  "main": "./dist/index.js",
+  "module": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    },
+    "./agent": {
+      "types": "./dist/agent.d.ts",
+      "import": "./dist/agent.js"
+    },
+    "./server": {
+      "types": "./dist/server-package.d.ts",
+      "import": "./dist/server-package.js"
+    },
+    "./tap": {
+      "types": "./dist/tap.d.ts",
+      "import": "./dist/tap.js"
+    }
+  },
+  "files": [
+    "dist",
+    "src",
+    "README.md"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "test": "tsx test/conformance.ts && tsx test/verifierMusts.test.ts && tsx test/instanceSuffix.test.ts",
+    "prepublishOnly": "npm run build"
+  },
+  "keywords": [
+    "ai-agents",
+    "provenance",
+    "audit",
+    "ed25519",
+    "tap",
+    "mcp",
+    "a2a"
+  ],
+  "dependencies": {
+    "@noble/ed25519": "^3.1.0",
+    "@noble/hashes": "1.8.0",
+    "canonicalize": "^3.0.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.2",
+    "tsx": "^4.19.2",
+    "typescript": "^5.7.2"
+  }
+}
