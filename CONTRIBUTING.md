@@ -11,38 +11,54 @@ Thanks for looking. TAP is early and the most useful contributions right now are
 1. update `tap_ref.py`,
 2. regenerate the vectors (`python3 tap_ref.py` — it writes `test-vectors.json` and self-checks),
 3. pass **both** SDK conformance suites,
-4. explain the wire-format impact in the PR description.
+4. update the §6.6 and §14 tables in the spec (CI compares them: `scripts/check-spec-vectors.py`),
+5. add an entry to `CHANGELOG.md` under *Changed signed bytes*,
+6. explain the wire-format impact in the PR description.
 
 A PR that changes signed bytes without regenerating vectors will be closed with a pointer back here. This isn't bureaucracy — a Signer and Verifier that disagree by one byte is the exact failure mode the whole protocol exists to prevent.
+
+**A new rule needs a negative vector.** If you add a MUST, add a case to the `negative` section of the vectors that fails when the rule is not enforced. A rule the vectors cannot fail is a rule nobody has to follow, and we have shipped several of those: the omit-absent-optionals rule was unenforceable for a whole release precisely because a divergent record still verifies against its own signature.
+
+**Cite anchor tags, not section numbers.** Every normative rule in the spec carries a stable `[TAP-…]` tag. Code comments cite the tag. Section numbers move between revisions and leave citations quietly, invisibly wrong — roughly forty of them were, before v0.1.2.
 
 ## Running everything
 
 ```bash
+# everything CI runs, in one command
+./scripts/ci-local.sh
+```
+
+Or piecemeal:
+
+```bash
 # reference implementation: regenerate + self-check the vectors
 python3 tap_ref.py
+python3 scripts/check-spec-vectors.py   # the spec's quoted values match the vectors
+python3 scripts/check-schemas.py        # the schemas + registries describe the vectors
 
 # Python SDK
 cd sdk/python
 pip install -e '.[dev]'
-PYTHONPATH=src python3 tests/test_conformance.py
+PYTHONPATH=src python3 tests/test_conformance.py        # reproduce every vector
+PYTHONPATH=src python3 tests/test_negative_vectors.py   # reject what the reference rejects
 PYTHONPATH=src python3 tests/test_verifier_musts.py
-PYTHONPATH=src python3 tests/test_policy.py
-PYTHONPATH=src python3 tests/test_instance_suffix.py
+PYTHONPATH=src python3 tests/test_handshake.py
 
 # TypeScript SDK
-cd sdk/js
-npm install
-npm test
-npm run build
+cd sdk/js && npm install && npm test && npm run build
+
+# Gateway + Inspector
+python3 gateway/test_gateway.py
+python3 inspector/test_inspector.py
 ```
 
-CI runs all of the above on every PR, plus a cross-language check that both SDKs produce identical signatures.
+CI runs all of the above on every PR, plus a cross-language job that checks both SDKs produce identical signatures **and compose identical bytes** for the same logical action — the two are different properties, and only the second catches an SDK whose own envelope shape has drifted.
 
 ## What's most useful
 
 **High value:**
 
-- **A third implementation.** A Go, Rust, or Java Signer that reproduces the vectors is the single strongest validation the spec can get. If the vectors are ambiguous enough that you had to guess, that's a spec bug — please report it as one.
+- **A third implementation.** A Go, Rust, or Java Signer that reproduces the vectors is the single strongest validation the spec can get — two implementations by the same authors agree partly because they share assumptions. If the vectors are ambiguous enough that you had to guess, that's a spec bug; please report it as one. Start with `schemas/`, `registries/`, and the `canonicalization` vector, which is where implementations actually diverge.
 - **Spec ambiguities.** Anywhere the prose admits two readings that produce different bytes.
 - **Cryptographic review.** Especially the canonicalization guard, the checkpoint Merkle construction, and the passport/event domain separation.
 - **Adversarial tests.** Signature confusion, replay, downgrade, canonicalization edge cases.

@@ -14,7 +14,7 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
-      - run: pip install cryptography jcs
+      - run: pip install cryptography jcs jsonschema
       # tap_ref.py regenerates test-vectors.json and self-checks. If the committed
       # vectors differ from what the reference produces, the contract is broken.
       - name: Regenerate and diff the conformance vectors
@@ -23,6 +23,14 @@ jobs:
           python3 tap_ref.py
           diff -u /tmp/committed.json test-vectors.json \
             || { echo "::error::test-vectors.json is out of sync with tap_ref.py"; exit 1; }
+      # The spec quotes live signatures and hashes in §6.6/§14. They were once
+      # stale for an entire release because nothing compared them to the vectors.
+      - name: Specification agrees with the vectors
+        run: python3 scripts/check-spec-vectors.py
+      # The published schemas and registries must describe the published vectors,
+      # or they are documentation that silently drifts.
+      - name: Schemas and registries describe the vectors
+        run: python3 scripts/check-schemas.py
 
   python-sdk:
     name: Python SDK
@@ -36,12 +44,18 @@ jobs:
         with:
           python-version: ${{ matrix.python-version }}
       - run: pip install cryptography jcs httpx
-      - name: Conformance
+      - name: Conformance (reproduce every vector)
         working-directory: sdk/python
         run: PYTHONPATH=src python3 tests/test_conformance.py
+      - name: Negative vectors (reject what the reference rejects)
+        working-directory: sdk/python
+        run: PYTHONPATH=src python3 tests/test_negative_vectors.py
       - name: Verifier MUST-behaviours
         working-directory: sdk/python
         run: PYTHONPATH=src python3 tests/test_verifier_musts.py
+      - name: Handshake + anti-downgrade binding
+        working-directory: sdk/python
+        run: PYTHONPATH=src python3 tests/test_handshake.py
       - name: Anti-downgrade (nego) binding
         working-directory: sdk/python
         run: PYTHONPATH=src python3 tests/test_nego.py
@@ -68,12 +82,29 @@ jobs:
           node-version: ${{ matrix.node-version }}
       - working-directory: sdk/js
         run: npm install
-      - name: Conformance + verifier MUSTs + unit tests
+      - name: Conformance + negatives + handshake + unit tests
         working-directory: sdk/js
         run: npm test
       - name: Type check / build
         working-directory: sdk/js
         run: npm run build
+
+  services:
+    name: Gateway and Inspector
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install cryptography jcs httpx fastapi
+      # The Gateway carries the two-sided attestation story for every upstream that
+      # is not TAP-aware, and the Inspector is what an implementer debugs with.
+      # Neither had a single test, or appeared in CI, before v0.1.2.
+      - name: Gateway (handshake, pass-through, independent server leg)
+        run: python3 gateway/test_gateway.py
+      - name: Inspector (agrees with the SDK it wraps)
+        run: python3 inspector/test_inspector.py
 
   cross-language:
     name: Python and TypeScript agree byte-for-byte
@@ -89,8 +120,8 @@ jobs:
       - run: pip install cryptography jcs httpx
       - working-directory: sdk/js
         run: npm install
-      # Both SDKs verify against the same committed vectors; if either drifts,
-      # the Signer/Verifier interoperability guarantee is gone.
+      # Both SDKs verify against the same committed vectors; if either drifts, the
+      # Signer/Verifier interoperability guarantee is gone.
       - name: Python against the vectors
         working-directory: sdk/python
         run: PYTHONPATH=src python3 tests/test_conformance.py
@@ -101,6 +132,54 @@ jobs:
         run: |
           (cd sdk/python && PYTHONPATH=src python3 tests/test_verifier_musts.py)
           (cd sdk/js && npx tsx test/verifierMusts.test.ts)
+      - name: Both cores reject the same negative vectors
+        run: |
+          (cd sdk/python && PYTHONPATH=src python3 tests/test_negative_vectors.py)
+          (cd sdk/js && npx tsx test/negativeVectors.test.ts)
+      # The strongest check here. Reproducing a vector proves an SDK can re-sign a
+      # body someone else composed; this proves the two COMPOSE identical bytes for
+      # the same logical action, which is where they actually diverged.
+      - name: The two SDKs compose identical envelopes
+        run: |
+          (cd sdk/js && npx tsx test/envelopeParity.test.ts)
+          (cd sdk/python && PYTHONPATH=src python3 tests/test_envelope_parity.py)
+      - name: A JS-signed record verifies in Python
+        run: |
+          (cd sdk/js && npx tsx test/interop.ts > /tmp/js_event.json)
+          cd sdk/python && PYTHONPATH=src python3 -c "
+          import json
+          from tap_sdk.core import verify_event, verify_passport
+          d = json.load(open('/tmp/js_event.json'))
+          assert verify_passport(d['jwk'], d['passport'])
+          assert verify_event(d['jwk'], d['event'])
+          print('ok - JS-signed passport and event verify in Python')
+          "
+
+  packaging:
+    name: Both packages install clean and import
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      # A quickstart whose very first command fails is not documentation. These
+      # install each package the way a reader would, from a clean environment.
+      - name: pip install the package and import it
+        run: |
+          python3 -m venv /tmp/clean
+          /tmp/clean/bin/pip install --quiet ./sdk/python
+          /tmp/clean/bin/python -c "from tap_sdk import TAPClient; import tap_sdk.verify; print('ok - traceable-agent-protocol imports')"
+      - name: npm pack the tarball and import it
+        run: |
+          cd sdk/js && npm install && npm run build
+          TARBALL=$(npm pack --silent)
+          mkdir -p /tmp/npmclean && cd /tmp/npmclean && npm init -y >/dev/null
+          npm install --silent "$OLDPWD/$TARBALL"
+          node --input-type=module -e "import('@traceableagent/sdk/agent').then(m => { if (!m.TAPClient) throw new Error('TAPClient missing'); console.log('ok - @traceableagent/sdk imports'); })"
 
   secrets:
     name: Secret scan

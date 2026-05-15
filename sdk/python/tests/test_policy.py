@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""SDK policy-engine tests (build spec §9.4).
+"""SDK policy-engine tests [TAP-POLICY-RECORD].
 
 Two guarantees:
   * the published SDK enforces inline (deny before acting), and
@@ -7,7 +7,7 @@ Two guarantees:
     — the policy hash is JCS-canonical and therefore implementation-neutral, just
     like the event signatures (the same cross-impl discipline as test_conformance).
 
-Run from distribution/sdk/python/:
+Run from sdk/python/:
     PYTHONPATH=src ../../../tap/.venv/bin/python tests/test_policy.py
 """
 import sys

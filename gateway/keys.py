@@ -1,7 +1,7 @@
 """JWKS fetch-and-cache resolver for the Gateway.
 
 The Gateway needs to resolve an inbound agent's public key from the Verifier's
-published JWKS in order to verify Passports (TAP-spec §3.2). No client-side JWKS
+published JWKS in order to verify Passports ([TAP-KEY-REVOCATION]). No client-side JWKS
 cache exists elsewhere in the repo — the Verifier only ever serves its own JWKS.
 """
 from __future__ import annotations

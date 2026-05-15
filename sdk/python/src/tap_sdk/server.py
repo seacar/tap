@@ -1,11 +1,11 @@
-"""TAPServer — server-attested provenance middleware (build spec §9.1).
+"""TAPServer — server-attested provenance middleware [TAP-ASSURANCE].
 
 A tool/resource operator wraps their handler with :meth:`TAPServer.attest`. On each
 inbound call the middleware, **before executing**:
 
   1. verifies the caller's Passport (signature, freshness) against the JWKS,
   2. enforces ``scope_used ⊆ passport.scope`` (drift) and the policy (§9.4),
-  3. rejects a duplicate ``(aid, action_ref)`` (replay defense, TAP-spec §7.2),
+  3. rejects a duplicate ``(aid, action_ref)`` (replay defense, [TAP-REPLAY]),
 
 then records the handler and signs a **server-attested** Event (``attestor:"server"``)
 echoing the caller's ``action_ref`` so the Verifier can join the two legs.
@@ -24,14 +24,23 @@ from typing import Any, Callable
 
 from .core import (
     DEFAULT_ISSUER,
+    DEFAULT_TTL_S,
     SPEC_VERSION,
     digest,
+    json_digest,
     load_signer,
     new_id,
     now_ts,
     scope_satisfied,
     sign_event,
+    text_digest,
     verify_passport,
+)
+from .negotiate import (
+    NegotiationFailed,
+    ack_headers,
+    hello_from_headers,
+    select,
 )
 from .policy import (
     PolicyDecision,
@@ -45,7 +54,7 @@ KeyResolver = Callable[[str], dict | None]  # kid -> public JWK
 
 class UnattestedAction(RuntimeError):
     """The inbound Passport is missing/invalid — the action is unattested and the
-    server MUST NOT infer authority from it (TAP-spec §12, downgrade defense)."""
+    server MUST NOT infer authority from it ([TAP-SIG-ALG], downgrade defense)."""
 
 
 class ServerDenied(RuntimeError):
@@ -102,6 +111,8 @@ class TAPServer:
         post_fn: PostFn | None = None,
         clock_skew_s: int = 60,
         flush_interval_s: float = 2.0,
+        replay_ttl_s: int | None = None,
+        attests: bool = True,
     ) -> None:
         self.server_id = server_id
         self.kid = kid
@@ -111,15 +122,29 @@ class TAPServer:
         self.enforce = enforce
         self.env = env
         self.clock_skew_s = clock_skew_s
+        # Whether this server actually signs execution legs. Answering
+        # `attestation:"server"` in a handshake and then not signing one produces
+        # exactly the `conflicting` state a Verifier holds against the AGENT
+        # [TAP-ASSURANCE], so the answer has to come from what we really do.
+        self.attests = attests
         self._sk = load_signer(private_key_hex)
         # flush_interval_s: how often the background reporter batches server-attested
-        # events to the Verifier (fail-open, TAP-spec §10). Production keeps the
+        # events to the Verifier (fail-open, [TAP-RESULT-CODES]). Production keeps the
         # default; a lower value trades a little efficiency for a snappier caller-visible
         # two-sided result (e.g. a demo polling for the server leg to land).
         self._reporter = EventReporter(endpoint, post_fn=post_fn, api_key=api_key,
                                        flush_interval_s=flush_interval_s)
-        self._seq: dict[str, int] = {}        # per-aid server seq space (TAP-spec §5.3/§6)
-        self._seen: set[tuple[str, str]] = set()  # (aid, action_ref) replay cache
+        self._seq: dict[str, int] = {}        # per-aid server seq space [TAP-EVT-SEQ]
+        # Replay cache [TAP-REPLAY]: keyed on the values whose uniqueness the
+        # protocol actually guarantees — the passport `jti` and `(aid, seq)`. It
+        # was previously keyed on `action_ref`, which a replayer simply regenerates,
+        # so it rejected nothing an attacker could not trivially route around.
+        #
+        # Entries expire (default: max passport TTL + skew), because a cache that
+        # only ever grows is a memory-exhaustion surface reachable by anyone able
+        # to mint identifiers — which, on an inbound edge, is everyone.
+        self._replay_ttl_s = replay_ttl_s if replay_ttl_s is not None else DEFAULT_TTL_S + clock_skew_s
+        self._seen: dict[tuple[str, Any], float] = {}
         self._lock = threading.RLock()  # reentrant: attest() holds it across _emit()
 
     # --- passport verification -----------------------------------------------
@@ -160,18 +185,34 @@ class TAPServer:
         policy_decision: dict | None = None,
         result_digest: str | None = None,
     ) -> dict:
+        # Digest-only, exactly like the agent leg [TAP-EVT-ENVELOPE]: the server
+        # leg is a peer Event in the same record, not a second format. Raw intent
+        # text here would put plaintext — possibly personal data — inside a signed
+        # body that survives every erasure request, which is precisely what the
+        # annex exists to prevent.
         action: dict[str, Any] = {
-            "kind": kind, "intent": intent, "tool": tool, "scope_used": scope_used,
+            "kind": kind,
+            "intent_digest": text_digest(intent),
+            "tool": tool,
+            "scope_used": scope_used,
         }
         if args is not None:
-            canon = json.dumps(args, separators=(",", ":"), sort_keys=True).encode()
-            action["args_digest"] = digest(canon)
-        result: dict[str, Any] = {"status": status, "code": code,
-                                  "latency_ms": latency_ms, "error": error}
+            # JCS, the same canonicalization the agent leg uses. Sorting keys with
+            # json.dumps is NOT the same function: the two legs of one action would
+            # digest identical arguments differently, and the correlation that makes
+            # two-sided attestation worth anything would silently never match.
+            action["args_digest"] = json_digest(args)
+        result: dict[str, Any] = {"status": status, "code": code, "error": error}
+        if latency_ms is not None:
+            result["latency_ms"] = latency_ms
         # The server attests a digest of what it actually returned — the grounded
         # baseline that lets live/shadow replay detect environment drift later.
         if result_digest is not None:
             result["result_digest"] = result_digest
+
+        # Absent optionals are OMITTED, never null [TAP-EVT-OMIT] — `null` and
+        # absent are different signed bytes, and the two legs must agree on the
+        # envelope shape or their checkpoints will not.
         body: dict[str, Any] = {
             "v": SPEC_VERSION,
             "event_id": new_id("evt"),
@@ -181,17 +222,76 @@ class TAPServer:
             "seq": self._next_seq(claims["aid"]),
             "ts": now_ts(),
             "action": action,
-            "evidence": {"reasoning": None, "model_output_digest": None},
             "result": result,
-            "attestor": "server",            # the execution leg (TAP-spec §6)
-            "action_ref": action_ref,        # echoed → correlates with the agent leg
-            "parent_event_id": None,
-            "policy_decision": policy_decision,
+            "attestor": "server",            # the execution leg [TAP-ASSURANCE]
+            "action_ref": action_ref,        # echoed -> correlates with the agent leg
             "kid": self.kid,                 # the SERVER's key, not the agent's
         }
+        if policy_decision is not None:
+            body["policy_decision"] = policy_decision
         event = sign_event(self._sk, body)
-        self._reporter.submit(event)
+        # The plaintext the digests stand for travels in the unsigned annex
+        # [TAP-EVT-ANNEX], where it can be crypto-shredded independently.
+        annex: dict[str, Any] = {"event_id": body["event_id"], "intent": intent}
+        if args is not None:
+            annex["args"] = args
+        self._reporter.submit(event, annex)
         return event
+
+    # --- replay defense [TAP-REPLAY] -----------------------------------------
+
+    def _check_replay(self, claims: dict, *, seq: int | None) -> str | None:
+        """Return a rejection reason for a replayed inbound call, or None.
+
+        Two independent guarantees, per [TAP-REPLAY]:
+
+        * ``jti`` uniqueness — one passport, one presentation at this edge;
+        * ``(aid, seq)`` monotonicity — a sequence slot is used once.
+
+        ``seq`` is optional because a caller need not have told us its sequence
+        number; when it is absent the `jti` check still stands on its own. What we
+        must NOT do is fall back to `action_ref`, which the caller picks freely.
+        """
+        now = time.time()
+        with self._lock:
+            # Expire first, so the cache stays bounded by TTL rather than by uptime.
+            if len(self._seen) > 1024:
+                cutoff = now - self._replay_ttl_s
+                self._seen = {k: v for k, v in self._seen.items() if v > cutoff}
+
+            keys: list[tuple[str, Any]] = [("jti", claims["jti"])]
+            if seq is not None:
+                keys.append((claims["aid"], seq))
+
+            for key in keys:
+                seen_at = self._seen.get(key)
+                if seen_at is not None and (now - seen_at) <= self._replay_ttl_s:
+                    label = ("passport jti" if key[0] == "jti"
+                             else f"(aid, seq) slot {key[1]}")
+                    return f"replayed {label}"
+            for key in keys:
+                self._seen[key] = now
+        return None
+
+    # --- handshake [TAP-NEGOTIATE] -------------------------------------------
+
+    def hello_ack(self, hello: dict[str, Any] | None) -> dict[str, Any] | None:
+        """Answer a Signer's ``tap_hello``.
+
+        Returns the ack to carry back (``X-TAP-Hello-Ack`` or
+        ``_meta.tap.hello_ack``), or None when there was no hello to answer.
+        Returns None rather than raising when nothing is mutually supported: per
+        [TAP-NEGOTIATE] the parties fall back to unattested operation, and the
+        Signer's missing `nego` binding is what makes that visible downstream.
+        """
+        try:
+            return select(hello, attests=self.attests)
+        except NegotiationFailed:
+            return None
+
+    def hello_ack_headers(self, headers: Any) -> dict[str, str]:
+        """Read a hello from inbound HTTP headers and build the response headers."""
+        return ack_headers(self.hello_ack(hello_from_headers(headers)))
 
     # --- the middleware entry point ------------------------------------------
 
@@ -205,6 +305,7 @@ class TAPServer:
         scope_used: str | None = None,
         arguments: Any = None,
         intent: str | None = None,
+        seq: int | None = None,
     ) -> Any:
         """Verify → enforce (pre-execution) → record → sign the execution attestation.
 
@@ -216,21 +317,18 @@ class TAPServer:
         scope_used = scope_used if scope_used is not None else f"call:{tool}"
         intent = intent or f"Execute {tool}"
 
-        # Replay defense (TAP-spec §7.2): reject a duplicate (aid, action_ref).
-        key = (claims["aid"], action_ref)
-        with self._lock:
-            if key in self._seen:
-                raise ServerDenied(
-                    f"replayed action_ref {action_ref}", code="VALIDATION_ERROR",
-                    event=self._emit(
-                        claims, kind="denied", intent=intent, tool=tool,
-                        scope_used=scope_used, action_ref=action_ref, args=arguments,
-                        status="denied", code="VALIDATION_ERROR",
-                        error="duplicate action_ref (replay)"),
-                )
-            self._seen.add(key)
+        # Replay defense [TAP-REPLAY]: `jti` uniqueness and (aid, seq) monotonicity.
+        replayed = self._check_replay(claims, seq=seq)
+        if replayed is not None:
+            raise ServerDenied(
+                replayed, code="VALIDATION_ERROR",
+                event=self._emit(
+                    claims, kind="denied", intent=intent, tool=tool,
+                    scope_used=scope_used, action_ref=action_ref, args=arguments,
+                    status="denied", code="VALIDATION_ERROR", error=replayed),
+            )
 
-        # Drift: scope_used must be authorized by the passport (TAP-spec §8).
+        # Drift: scope_used must be authorized by the passport ([TAP-SCOPE-MATCH]).
         if self.enforce and not scope_satisfied(scope_used, claims.get("scope", [])):
             ev = self._emit(
                 claims, kind="denied", intent=intent, tool=tool, scope_used=scope_used,

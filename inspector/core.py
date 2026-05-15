@@ -1,10 +1,13 @@
-"""TAP Inspector — shared logic layer (whitepaper §15).
+"""TAP Inspector — shared logic layer.
 
-A local developer tool to mint test Passports, sign/verify Events, and
-visualize a record's chain — analogous to the MCP Inspector. Every function
-here is a thin wrapper over existing primitives (`tap_sdk`, `verifier.verify`); nothing in this module invents new crypto or verification
-logic. Both the CLI (`inspector.cli`) and the local web UI (`inspector.app`)
-import only from here, so they can never diverge in behavior.
+A local developer tool to mint test Passports, sign/verify Events, and visualize a
+record's chain — analogous to the MCP Inspector. Every function here is a thin
+wrapper over `tap_sdk`; nothing in this module invents new crypto or verification
+logic, because a debugging tool that verifies differently from the SDK teaches you
+about the tool rather than about your records.
+
+Both the CLI (`inspector.cli`) and the local web UI (`inspector.app`) import only
+from here, so the two can never diverge in behaviour.
 """
 from __future__ import annotations
 
@@ -14,8 +17,6 @@ import secrets
 import sys
 from pathlib import Path
 from typing import Callable
-
-# inspector/ lives in distribution/, but the primitives it wraps (shared,
 
 import httpx
 
@@ -30,10 +31,9 @@ KeyResolver = Callable[[str], dict | None]
 def generate_key(kid: str | None = None) -> dict:
     """Mint a fresh Ed25519 test identity.
 
-    Mirrors the key-generation branch inline in `verifier/app.py::register_agent`
-    (secrets -> load_signer -> public_jwk), reimplemented standalone here rather
-    than imported, so the Inspector never depends on the Verifier's FastAPI app
-    or its multi-tenant backend — just the crypto primitives.
+    Deliberately standalone: generating a test identity needs nothing but the
+    crypto primitives, so the Inspector never pulls in a Verifier service or its
+    storage backend just to mint a throwaway key.
     """
     from tap_sdk.core import new_id
 

@@ -42,16 +42,28 @@ from .core import (
     text_digest,
     verify_passport,
 )
+from .negotiate import (
+    Negotiated,
+    hello_headers,
+    offer as build_hello,
+    read_ack,
+)
 from .policy import PolicyDecision, PolicyRequest, evaluate as _evaluate_policy
+from .authority import Authorization, AuthorityExpired, check_authority_window
 
 PostFn = Callable[[str, dict, dict], None]
 
 _VALID_ATTESTATION = {"requested", "server", "none"}
 
 
+def _suite_id() -> str:
+    """The suite this build signs with [TAP-SUITE-DISPATCH]. v0.1 has exactly one."""
+    return "tap-ed25519"
+
+
 class DelegationRejected(RuntimeError):
     """Raised when a receiving agent refuses an inbound A2A delegation — a bad
-    signature, an expired or forged passport, or a replay (TAP-spec §8).
+    signature, an expired or forged passport, or a replay (spec §8, [TAP-REPLAY]).
 
     A2A's base spec accepts delegated work without verifying the sender. This
     rejection *is* the guarantee TAP adds: a broken handoff breaks the chain
@@ -74,7 +86,7 @@ def _peek_jwt_kid(compact_jwt: str) -> str | None:
 
 class PolicyDenied(RuntimeError):
     """Raised when inline enforcement blocks an action before it executes
-    (build spec §9.4). The blocked attempt is still recorded as a signed
+    [TAP-POLICY-RECORD]. The blocked attempt is still recorded as a signed
     ``denied`` event — TAPClient stops the action *and* keeps the evidence."""
 
     def __init__(self, decision: PolicyDecision, *, tool: str) -> None:
@@ -100,8 +112,8 @@ class _Reporter:
     """Async, buffered, fail-open event transport (never blocks the agent).
 
     Each queued item is a ``(event, annex | None)`` pair. Annexes are the
-    unsigned plaintext companions to digest-only signed bodies (TAP-spec §6.1.1,
-    §11.3). They travel in the same HTTP batch as their events so the Verifier
+    unsigned plaintext companions to digest-only signed bodies ([TAP-EVT-ANNEX],
+    spec §11.3). They travel in the same HTTP batch as their events so the Verifier
     can index them without a second round-trip.
     """
 
@@ -144,7 +156,7 @@ class _Reporter:
         annexes = [ax for _, ax in batch if ax is not None]
         payload: dict = {"events": events}
         if annexes:
-            payload["annexes"] = annexes  # TAP-spec §11.3
+            payload["annexes"] = annexes  # spec §11.3
         if self._passport_jwt:
             payload["passport"] = self._passport_jwt
         try:
@@ -175,12 +187,21 @@ class _Reporter:
 class Passport:
     compact: str
     claims: dict
-    attestation: str = "none"  # negotiated assurance level for this record (§4.1)
+    # The assurance level asserted for this record. When a real handshake happens
+    # this is overwritten by the observed `tap_hello_ack` (see `record_ack`);
+    # otherwise it is what the caller asserted at mint time [TAP-NEGO-BINDING].
+    attestation: str = "none"
+    #: The observed handshake outcome, when there was one. Preferred over
+    #: `attestation` for the `nego` binding, because it is evidence rather than
+    #: configuration.
+    negotiated: Negotiated | None = None
     _seq: int = field(default=0, repr=False)
     _lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
-    # Tracks event_ids emitted since the last checkpoint for Merkle construction (§6.3).
+    # Tracks event_ids emitted since the last checkpoint for Merkle construction
+    # [TAP-EVT-CHECKPOINT].
     _event_ids: list[str] = field(default_factory=list, repr=False)
     _last_cp_count: int = field(default=0, repr=False)
+    _last_cp_through_seq: int = field(default=0, repr=False)
     _nego_emitted: bool = field(default=False, repr=False)
 
     @property
@@ -202,24 +223,61 @@ class Passport:
         with self._lock:
             self._event_ids.append(event_id)
 
-    def http_headers(self, action_ref: str | None = None) -> dict[str, str]:
-        """Passport carriage for HTTP transport (TAP-spec §10.1).
+    def record_ack(self, ack: dict[str, Any] | None) -> Negotiated | None:
+        """Record the ``tap_hello_ack`` observed from a TAP-aware Server.
+
+        This is the honest input to the anti-downgrade binding: what the Signer
+        was actually told, as opposed to what its operator hoped for. An absent or
+        unusable ack leaves the passport unnegotiated, which is itself the correct
+        signal — a stripped handshake produces no ack, so no `nego` is bound, and
+        the record is labelled intent-only [TAP-NEGO-BINDING].
+        """
+        outcome = read_ack(ack)
+        if outcome is not None:
+            with self._lock:
+                self.negotiated = outcome
+                self.attestation = outcome.attestation
+        return outcome
+
+    def nego(self) -> dict[str, str] | None:
+        """The value to bind into ``evidence.nego``, or None to bind nothing.
+
+        Prefers an observed handshake outcome over an asserted one. Returns None
+        for ``attestation:"none"``, so an unnegotiated record stays silent rather
+        than claiming intent-only assurance it was never promised."""
+        if self.negotiated is not None:
+            return self.negotiated.as_nego()
+        if self.attestation == "none":
+            return None
+        return {"version": SPEC_VERSION, "suite": _suite_id(),
+                "attestation": self.attestation}
+
+    def http_headers(self, action_ref: str | None = None, *,
+                     hello: dict[str, Any] | None = None) -> dict[str, str]:
+        """Passport carriage for HTTP transport (spec §11.1).
 
         Sits alongside any ``Authorization`` header — TAP adds provenance, it
-        does not replace access control."""
+        does not replace access control. Pass ``hello`` on the first request of a
+        session to carry the handshake [TAP-NEGOTIATE]."""
         h = {"X-Agent-Passport": self.compact}
         if action_ref:
             h["X-TAP-Action-Ref"] = action_ref
+        if hello:
+            h.update(hello_headers(hello))
         return h
 
-    def meta(self, action_ref: str | None = None) -> dict[str, Any]:
-        """Passport carriage for JSON-RPC ``_meta`` transport (TAP-spec §10.2).
+    def meta(self, action_ref: str | None = None, *,
+             hello: dict[str, Any] | None = None) -> dict[str, Any]:
+        """Passport carriage for JSON-RPC ``_meta`` transport (spec §11.2).
 
         The binding for stdio MCP and A2A Tasks/Messages, where no HTTP headers
-        exist. The same signed bytes verify identically either way."""
+        exist. The same signed bytes verify identically either way. ``hello`` is
+        included only on the first request of a session."""
         tap: dict[str, Any] = {"passport": self.compact}
         if action_ref:
             tap["action_ref"] = action_ref
+        if hello:
+            tap["hello"] = hello
         return {"tap": tap}
 
 
@@ -236,17 +294,17 @@ class TAPClient:
         self.framework = framework
         self.model = model
         self.capture_previews = capture_previews
-        # Policy-as-code (build spec §9.4): ``enforce`` denies before acting.
+        # Policy-as-code [TAP-POLICY-RECORD]: ``enforce`` denies before acting.
         self.policy = policy
         self.enforce = enforce
         self.env = env
         self._sk = load_signer(private_key_hex)
-        # Cache the negotiated crypto suite once (TAP-spec §3.6) — the shape
+        # Cache the negotiated crypto suite once ([TAP-SUITE-DISPATCH]) — the shape
         # bound into evidence.nego on the first event of each record (§4.1).
         self._suite = suite_for_jwk(public_jwk(self._sk, self.kid))
         self._reporter = _Reporter(endpoint, api_key=api_key, post_fn=post_fn)
         self._passport: Passport | None = None
-        # Inbound-delegation replay cache (TAP-spec §8): (sender jti, action_ref).
+        # Inbound-delegation replay cache [TAP-REPLAY]: (sender jti, action_ref).
         self._a2a_seen: set[tuple[str, Any]] = set()
         self._a2a_lock = threading.Lock()
 
@@ -255,7 +313,7 @@ class TAPClient:
     def issue_passport(self, *, task_prompt: str, scope: list[str],
                        ttl_s: int = DEFAULT_TTL_S, attestation: str = "none",
                        cid: str | None = None) -> Passport:
-        """Mint a passport at the start of a record (TAP-spec §4).
+        """Mint a passport at the start of a record ([TAP-PASSPORT-LIFECYCLE]).
 
         ``attestation`` declares the assurance level this record expects to
         achieve — ``"server"`` when a TAPServer/Gateway sits in front of the
@@ -292,13 +350,35 @@ class TAPClient:
         self._reporter.set_passport(passport.compact)
         return passport
 
+    # --- handshake [TAP-NEGOTIATE] -------------------------------------------
+
+    def hello(self, *, attestation: str = "requested") -> dict[str, Any]:
+        """Build the ``tap_hello`` to send on the first request of a session.
+
+        Carry it with ``passport.http_headers(hello=...)`` or
+        ``passport.meta(hello=...)``, then feed whatever comes back to
+        :meth:`negotiate`.
+        """
+        return build_hello(kid=self.kid, attestation=attestation)
+
+    def negotiate(self, ack: dict[str, Any] | None,
+                  passport: Passport | None = None) -> Negotiated | None:
+        """Record the Server's ``tap_hello_ack`` against the current record.
+
+        Returns the negotiated outcome, or None when no usable ack arrived — the
+        case a stripped handshake produces. Callers do not need to branch on it:
+        an unnegotiated record simply binds no ``nego`` and is labelled
+        intent-only, which is the honest outcome [TAP-NEGO-BINDING].
+        """
+        return self._require(passport).record_ack(ack)
+
     def _require(self, p: Passport | None) -> Passport:
         p = p or self._passport
         if p is None:
             raise RuntimeError("no passport — call issue_passport() first")
         return p
 
-    # --- policy (build spec §9.4) --------------------------------------------
+    # --- policy [TAP-POLICY-RECORD] ---------------------------------------
 
     def set_policy(self, policy: dict | None, *, enforce: bool | None = None) -> None:
         self.policy = policy
@@ -317,6 +397,29 @@ class TAPClient:
         )
         return _evaluate_policy(self.policy, req)
 
+    # --- authority binding [TAP-EVT-AUTHORIZATION, §9.2, PROVISIONAL] ---------
+    # Stateless half only: minting an approval and checking its validity window.
+    # Revocation and single-use enforcement are stateful and live on the
+    # Verifier, not here — see tap_sdk.authority's module docstring.
+
+    def authorize(self, *, target_state: dict, authority_state: dict,
+                  ttl_s: int = DEFAULT_TTL_S, issuer_kid: str | None = None,
+                  authz_id: str | None = None) -> Authorization:
+        """Mint a bound approval for an action not yet taken.
+
+        ``target_state`` is the expected resulting state (digested here, never
+        signed in the raw); ``authority_state`` is the policy/permission state
+        this approval was granted under (digested the same way
+        ``policy_version`` digests a policy set). Pass the returned
+        :class:`Authorization` to :meth:`trace` via its ``authorize=`` kwarg.
+        """
+        now = int(time.time())
+        return Authorization.grant(
+            target_state=target_state, authority_state=authority_state,
+            nbf=now, exp=now + ttl_s,
+            issuer_kid=issuer_kid or self.kid, authz_id=authz_id,
+        )
+
     # --- event signing --------------------------------------------------------
 
     def _emit(self, passport: Passport, *, kind: str, intent: str, tool: str,
@@ -326,8 +429,9 @@ class TAPClient:
               action_ref: str | None = None, attestor: str = "agent",
               parent_event_id: str | None = None, decision: dict | None = None,
               policy_decision: dict | None = None,
+              authorization: dict | None = None, effect_digest: str | None = None,
               extra_annex: dict | None = None) -> dict:
-        """Sign one event with a digest-only body (TAP-spec §6.1).
+        """Sign one event with a digest-only body ([TAP-EVT-ENVELOPE]).
 
         Plaintext ``intent``, ``args``, and ``reasoning`` go into an unsigned,
         crypto-shreddable annex (§6.1.1) rather than the signed body. Only their
@@ -359,18 +463,20 @@ class TAPClient:
             evidence["model_output_digest"] = text_digest(model_output)
 
         # Bind the negotiated outcome into the FIRST Event of the record, once
-        # (anti-downgrade, TAP-spec §4.1). Guarded by the same lock next_seq()
-        # uses, so "assign my seq" and "claim the nego slot" happen atomically —
+        # [TAP-NEGO-BINDING]. Guarded by the same lock next_seq() uses, so
+        # "assign my seq" and "claim the nego slot" happen atomically —
         # concurrent emitters can't both think they're first.
-        if passport.attestation != "none":
+        #
+        # `passport.nego()` prefers the ack actually observed from the Server over
+        # anything the caller asserted at mint time, and returns None when there is
+        # nothing honest to say. A stripped handshake therefore yields no binding
+        # at all, which is exactly the signal a Verifier needs.
+        nego = passport.nego()
+        if nego is not None:
             with passport._lock:
                 if not passport._nego_emitted:
                     passport._nego_emitted = True
-                    evidence["nego"] = {
-                        "version": SPEC_VERSION,
-                        "suite": self._suite,
-                        "attestation": passport.attestation,
-                    }
+                    evidence["nego"] = nego
 
         if extra_annex:
             annex.update(extra_annex)
@@ -380,11 +486,17 @@ class TAPClient:
         # keeps the canonical form deterministic. `null` and absent are different
         # signed bytes, so two Signers that disagree here produce structurally
         # different events for logically identical actions.
+        result: dict[str, Any] = {"status": status, "code": code, "latency_ms": latency_ms, "error": error}
+        if effect_digest is not None:
+            # [TAP-AUTHORITY-EFFECT, §9.2, provisional] — omit when unmeasured,
+            # never null, matching every other optional field's omit discipline.
+            result["effect_digest"] = effect_digest
+
         body: dict[str, Any] = {
             "v": SPEC_VERSION, "event_id": event_id, "passport_jti": passport.jti,
             "aid": passport.aid, "cid": passport.cid, "seq": passport.next_seq(),
             "ts": now_ts(), "action": action,
-            "result": {"status": status, "code": code, "latency_ms": latency_ms, "error": error},
+            "result": result,
             "attestor": attestor, "action_ref": action_ref or new_id("act"),
             "kid": self.kid,
         }
@@ -394,6 +506,9 @@ class TAPClient:
             body["parent_event_id"] = parent_event_id
         if policy_decision is not None:
             body["policy_decision"] = policy_decision
+        if authorization is not None:
+            # [TAP-EVT-AUTHORIZATION, §9.2, provisional]
+            body["authorization"] = authorization
         if decision is not None:
             body["decision"] = decision
         event = sign_event(self._sk, body)
@@ -412,14 +527,27 @@ class TAPClient:
     # --- public surface -------------------------------------------------------
 
     def trace(self, *, tool: str, scope: str, kind: str = "tool_call",
-              intent: str | None = None):
+              intent: str | None = None, authorize: Authorization | None = None,
+              effect_of: Callable[[Any], Any] | None = None):
+        """Wrap ``fn`` in a signed provenance record.
+
+        ``authorize`` binds this call to a pre-declared expected effect
+        [TAP-EVT-AUTHORIZATION, §9.2, provisional]: its validity window is
+        checked *before* ``fn`` runs — an expired approval blocks the call
+        exactly like a policy denial does — and if ``effect_of`` is given, the
+        digest of ``effect_of(fn's return value)`` is compared against the
+        approval's declared ``target_state_digest`` and recorded as
+        ``result.effect_digest``. Omit ``effect_of`` to still bind and validate
+        the approval without asserting a specific effect (the Event is then
+        labeled ``unverified_authority`` downstream).
+        """
         def deco(fn: Callable) -> Callable:
             @functools.wraps(fn)
             def wrap(*a, **kw):
                 p = self._require(None)
                 call_args = {"args": list(a), "kwargs": kw}
 
-                # Enforcement point: deny *before acting* (build spec §9.4).
+                # Enforcement point: deny *before acting* [TAP-POLICY-RECORD].
                 pd = self._decide(kind=kind, tool=tool, scope_used=scope, args=kw)
                 if pd is not None and pd.denied and self.enforce:
                     self._emit(p, kind="denied", intent=intent or f"Call {tool}",
@@ -428,10 +556,29 @@ class TAPClient:
                                policy_decision=pd.to_record())
                     raise PolicyDenied(pd, tool=tool)
 
+                # Second, independent enforcement point: deny *before acting*
+                # when the bound approval has expired [TAP-AUTHORITY-VALIDITY].
+                # Revocation/reuse are NOT checked here — they are stateful and
+                # belong to the Verifier (§9.2, provisional).
+                if authorize is not None:
+                    try:
+                        check_authority_window(authorize, now=int(time.time()))
+                    except AuthorityExpired:
+                        self._emit(p, kind="denied", intent=intent or f"Call {tool}",
+                                   tool=tool, scope_used=scope, args=call_args,
+                                   status="denied", code="DENIED_AUTHORITY_EXPIRED",
+                                   policy_decision=pd.to_record() if pd is not None else None,
+                                   authorization=authorize.to_record())
+                        raise
+
                 t0 = time.monotonic()
                 status, code, error = "success", "OK", None
+                effect_digest = None
                 try:
-                    return fn(*a, **kw)
+                    ret = fn(*a, **kw)
+                    if authorize is not None and effect_of is not None:
+                        effect_digest = json_digest(effect_of(ret))
+                    return ret
                 except Exception as exc:
                     status, code, error = "failure", "TOOL_ERROR", str(exc)
                     raise
@@ -440,7 +587,9 @@ class TAPClient:
                                scope_used=scope, args=call_args,
                                status=status, code=code, error=error,
                                latency_ms=round((time.monotonic() - t0) * 1000),
-                               policy_decision=pd.to_record() if pd is not None else None)
+                               policy_decision=pd.to_record() if pd is not None else None,
+                               authorization=authorize.to_record() if authorize is not None else None,
+                               effect_digest=effect_digest)
             return wrap
         return deco
 
@@ -448,7 +597,7 @@ class TAPClient:
                  scope_used: str | None = None, selection: str | None = None,
                  reasoning: str | None = None, decision_key: str = "decision",
                  passport: Passport | None = None) -> dict:
-        """Record a decision AND the alternatives not taken (TAP-spec §6.4).
+        """Record a decision AND the alternatives not taken ([TAP-EVT-DECISION]).
 
         The signed body carries only digests; plaintext question and option
         rationale/reason go to the annex. Scores MUST be strings (§3.4).
@@ -505,7 +654,7 @@ class TAPClient:
                           extra_annex=extra_annex or None)
 
     def emit_checkpoint(self, passport: Passport | None = None) -> dict:
-        """Emit a signed checkpoint event sealing the current record segment (TAP-spec §6.3).
+        """Emit a signed checkpoint event sealing the current record segment ([TAP-EVT-CHECKPOINT]).
 
         Builds the Merkle root over all event_ids emitted since the previous
         checkpoint (or since the passport was issued). The signed ``checkpoint``
@@ -515,9 +664,11 @@ class TAPClient:
         p = self._require(passport)
         with p._lock:
             interval_ids = p._event_ids[p._last_cp_count:]
-            through_seq = p._seq          # highest seq before this checkpoint
+            from_seq = p._last_cp_through_seq   # exclusive lower bound; 0 for the first
+            through_seq = p._seq                # highest seq before this checkpoint
             count = len(interval_ids)
             p._last_cp_count = len(p._event_ids)
+            p._last_cp_through_seq = through_seq
 
         root = checkpoint_root(interval_ids)
         cp_seq = p.next_seq()
@@ -532,6 +683,13 @@ class TAPClient:
             "ts": now_ts(),
             "action": {"kind": "checkpoint", "tool": None, "scope_used": None},
             "checkpoint": {
+                # The interval is half-open and self-describing: (from_seq,
+                # through_seq]. Carrying the lower bound in the signed body is what
+                # lets a Verifier reconcile this checkpoint alone, without
+                # reconstructing the state of whichever checkpoint preceded it —
+                # and without mis-scoping the interval when an earlier checkpoint
+                # was lost or suppressed [TAP-EVT-CHECKPOINT].
+                "from_seq": from_seq,
                 "through_seq": through_seq,
                 "event_id_root": root,
                 "count": count,
@@ -566,7 +724,7 @@ class TAPClient:
             model_output=text,
         )
 
-    # --- MCP: instrument an existing client (TAP-spec §10.2) ------------------
+    # --- MCP: instrument an existing client (spec §11.2) ------------------
 
     def instrument_mcp(self, mcp_client: Any, *, passport: Passport | None = None) -> Any:
         """Wrap an MCP client's ``call_tool`` so every ``tools/call`` attaches
@@ -615,7 +773,7 @@ class TAPClient:
         mcp_client.call_tool = wrapped  # type: ignore[attr-defined]
         return mcp_client
 
-    # --- A2A: outbound delegation (TAP-spec §8) -------------------------------
+    # --- A2A: outbound delegation (spec §8.1) ---------------------------------
 
     def sign_a2a_delegation(self, *, target_agent: str, intent: str,
                             scope_used: str = "delegate:agent", task_payload: Any = None,

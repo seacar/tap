@@ -1,6 +1,6 @@
 {
   "name": "@traceableagent/sdk",
-  "version": "0.1.0",
+  "version": "0.1.2",
   "description": "Traceable Agent Protocol (TAP) SDKs \u2014 agent signing (@traceableagent/sdk/agent) and server attestation (@traceableagent/sdk/server).",
   "license": "Apache-2.0",
   "type": "module",
@@ -32,7 +32,7 @@
   ],
   "scripts": {
     "build": "tsc -p tsconfig.json",
-    "test": "tsx test/conformance.ts && tsx test/verifierMusts.test.ts && tsx test/instanceSuffix.test.ts",
+    "test": "tsx test/conformance.ts && tsx test/negativeVectors.test.ts && tsx test/verifierMusts.test.ts && tsx test/nego.test.ts && tsx test/envelopeParity.test.ts && tsx test/instanceSuffix.test.ts",
     "prepublishOnly": "npm run build"
   },
   "keywords": [
@@ -53,5 +53,14 @@
     "@types/node": "^22.10.2",
     "tsx": "^4.19.2",
     "typescript": "^5.7.2"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/traceable-agent-protocol/tap.git",
+    "directory": "sdk/js"
+  },
+  "homepage": "https://github.com/traceable-agent-protocol/tap#readme",
+  "bugs": {
+    "url": "https://github.com/traceable-agent-protocol/tap/issues"
   }
 }

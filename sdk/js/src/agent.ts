@@ -4,6 +4,8 @@
  */
 export * from "./tap.js";
 export * from "./client.js";
+export * from "./negotiate.js";
+export * from "./verify.js";
 export * from "./api.js";
 export * from "./agentId.js";
 export * from "./instanceSuffix.js";

@@ -40,15 +40,22 @@ run "tap_ref.py self-check" python3 tap_ref.py
 run "vectors reproduce byte-for-byte" \
   diff -q /tmp/tap-committed-vectors.json test-vectors.json
 rm -f /tmp/tap-committed-vectors.json
+# The spec quotes live signatures and hashes; they were stale for a whole release
+# because nothing compared them to the vectors.
+run "spec agrees with the vectors"     python3 scripts/check-spec-vectors.py
+run "schemas + registries describe it" python3 scripts/check-schemas.py
 
 echo
 echo "python SDK"
 pushd sdk/python >/dev/null
 export PYTHONPATH=src
-run "conformance"                 python3 tests/test_conformance.py
+run "conformance (every vector)"  python3 tests/test_conformance.py
+run "negative vectors"            python3 tests/test_negative_vectors.py
 run "verifier MUST-behaviours"    python3 tests/test_verifier_musts.py
+run "handshake + nego binding"    python3 tests/test_handshake.py
 run "anti-downgrade (nego)"       python3 tests/test_nego.py
 run "policy engine"               python3 tests/test_policy.py
+run "authority binding (§9.2)"    python3 tests/test_authority.py
 run "instance suffix"             python3 tests/test_instance_suffix.py
 run "core imports w/o network deps" \
   python3 -c "import tap_sdk.core, tap_sdk.verify"
@@ -71,6 +78,14 @@ run "type check / build"               npm run build
 popd >/dev/null
 
 echo
+echo "gateway + inspector"
+# The Gateway carries the two-sided story for every upstream that is not
+# TAP-aware; the Inspector is what an implementer debugs with. Neither had a
+# single test before v0.1.2.
+run "gateway"    python3 gateway/test_gateway.py
+run "inspector"  python3 inspector/test_inspector.py
+
+echo
 echo "cross-language agreement"
 # Both SDKs verify against the same committed vectors; if either drifts, the
 # Signer/Verifier interoperability guarantee is gone.
@@ -78,6 +93,20 @@ run "python against the vectors" \
   env PYTHONPATH=sdk/python/src python3 sdk/python/tests/test_conformance.py
 run "typescript against the same vectors" \
   bash -c 'cd sdk/js && npx tsx test/conformance.ts'
+run "both reject the same negatives" \
+  bash -c 'cd sdk/js && npx tsx test/negativeVectors.test.ts'
+# The strongest check: reproducing a vector proves an SDK can re-sign a body
+# someone else composed. This proves the two COMPOSE identical bytes.
+run "the two SDKs compose identical envelopes" \
+  bash -c 'cd sdk/js && npx tsx test/envelopeParity.test.ts && cd ../python && PYTHONPATH=src python3 tests/test_envelope_parity.py'
+run "a JS-signed record verifies in python" \
+  bash -c 'cd sdk/js && npx tsx test/interop.ts > /tmp/js_event.json && cd ../python && PYTHONPATH=src python3 -c "
+import json
+from tap_sdk.core import verify_event, verify_passport
+d = json.load(open(\"/tmp/js_event.json\"))
+assert verify_passport(d[\"jwk\"], d[\"passport\"])
+assert verify_event(d[\"jwk\"], d[\"event\"])
+"'
 
 echo
 echo "secret scan"

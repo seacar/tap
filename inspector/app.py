@@ -1,4 +1,4 @@
-"""TAP Inspector — local web UI (whitepaper §15).
+"""TAP Inspector — local web UI ([TAP-SUITE-DISPATCH]).
 
 A small FastAPI app, server-rendered HTML (hand-built strings, no Jinja2 — this
 repo has no templating dependency today and a handful of simple forms doesn't
@@ -7,7 +7,7 @@ exact same functions the CLI (`inspector.cli`) calls — so the two front-ends
 can never diverge in behavior. Stateless: no session store; each result page
 pre-fills the next form's fields via query-string links.
 
-Run:  python distribution/inspector/serve.py   (binds 127.0.0.1 only by default)
+Run:  python inspector/serve.py   (binds 127.0.0.1 only by default)
 """
 from __future__ import annotations
 
@@ -86,7 +86,7 @@ def _pre(obj) -> str:
 def index() -> HTMLResponse:
     body = (
         "<p>Local dev tool to mint test Passports, sign/verify Events, and "
-        "visualize a record's chain (TAP whitepaper §15). Everything here runs "
+        "visualize a record's chain (the spec). Everything here runs "
         "against your own local keys — nothing is submitted to a live Verifier "
         "unless you explicitly point a form at one.</p>"
         '<ul><li><a href="/mint">Mint a Passport</a></li>'
@@ -108,7 +108,7 @@ def _mint_form(*, private_key_hex="", kid="", prompt="", scope="", attestation="
         + _field("Attestation", "attestation", value=attestation,
                  options=["none", "requested", "server"])
         + '<p class="hint">attestation="server" declares this record expects a '
-          "server-attested leg (TAP-spec §4.1) — a Verifier will flag it as "
+          "server-attested leg ([TAP-NEGO-BINDING]) — a Verifier will flag it as "
           "conflicting if that leg never actually arrives.</p>"
         + "<button>Mint</button></form>"
     )

@@ -1,6 +1,6 @@
 [project]
 name = "traceable-agent-protocol"
-version = "0.1.0"
+version = "0.1.3"
 description = "Traceable Agent Protocol (TAP) SDK — sign and verify agent provenance (passports, events, decisions)."
 readme = "README.md"
 requires-python = ">=3.10"
@@ -24,8 +24,10 @@ http = ["httpx>=0.27"]
 dev = ["httpx>=0.27", "pytest>=8"]
 
 [project.urls]
-Homepage = "https://github.com/OWNER/tap"
-Specification = "https://github.com/OWNER/tap/blob/main/TAP-spec-v0.1.md"
+Homepage = "https://github.com/traceable-agent-protocol/tap"
+Specification = "https://github.com/traceable-agent-protocol/tap/blob/main/TAP-spec-v0.1.md"
+Changelog = "https://github.com/traceable-agent-protocol/tap/blob/main/CHANGELOG.md"
+Issues = "https://github.com/traceable-agent-protocol/tap/issues"
 
 [build-system]
 requires = ["hatchling"]

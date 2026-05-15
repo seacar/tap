@@ -1,0 +1,28 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/traceable-agent-protocol/tap/schemas/passport.schema.json",
+  "title": "TAP Passport claims",
+  "description": "The claim set of a TAP Passport — a short-lived compact JWS asserting an agent instance's identity and authorized scope. Normative definition: TAP-spec-v0.1.md §5.\n\nThe JOSE header is NOT described here; it is fixed at {\"alg\":\"EdDSA\",\"typ\":\"tap-passport+jwt\",\"kid\":\"...\"} and a Verifier MUST reject any other `typ` [TAP-PASSPORT-HEADER].\n\nValidating this schema is necessary but nowhere near sufficient: a Passport is authoritative only after its signature, freshness and revocation checks pass [TAP-PASSPORT-VALIDATE].",
+  "type": "object",
+  "required": ["iss", "iat", "exp", "jti", "aid", "cid", "scope"],
+  "properties": {
+    "iss": { "type": "string", "format": "uri", "description": "Issuer; the JWKS origin used to resolve `kid`." },
+    "iat": { "type": "integer", "minimum": 0, "maximum": 9007199254740991, "description": "Issued-at, epoch seconds. Also the timestamp compared against a key's revoked_at [TAP-KEY-REVOCATION]." },
+    "exp": { "type": "integer", "minimum": 0, "maximum": 9007199254740991, "description": "Expiry. Default TTL SHOULD be <= 3600 s; acceptance is iat-60 <= now < exp+60." },
+    "jti": { "type": "string", "minLength": 1, "description": "Unique passport id, sortable. Its uniqueness is one of the two replay guarantees [TAP-REPLAY]." },
+    "aid": { "type": "string", "minLength": 1, "description": "Agent instance id, unique per record." },
+    "cid": { "type": "string", "pattern": "^sha256:[0-9a-f]{64}$", "description": "Context id binding every Event of this record. Opaque to a Verifier, which never recomputes it." },
+    "scope": {
+      "type": "array",
+      "items": { "type": "string", "pattern": "^[^:]+:.+$" },
+      "description": "Authorized capabilities as \"<verb>:<resource>\". Matched by EXACT string equality — no wildcards, no prefixes [TAP-SCOPE-MATCH]."
+    },
+    "prev_jti": { "type": "string", "description": "OPTIONAL — predecessor on renewal. Scope MUST be a subset of the predecessor's: authority may narrow, never widen [TAP-PASSPORT-LIFECYCLE]." },
+    "meta": {
+      "type": "object",
+      "description": "OPTIONAL, non-authoritative context (framework, model, agent_name). NEVER trusted for a security decision.",
+      "additionalProperties": true
+    }
+  },
+  "additionalProperties": true
+}
