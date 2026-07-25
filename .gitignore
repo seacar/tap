@@ -1,0 +1,36 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Node
+node_modules/
+sdk/js/dist/
+*.tsbuildinfo
+
+# Env & secrets — never commit these
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+identities/
+.tap/
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+
+# Internal roadmap — deliberately kept OUTSIDE this repo, one level up.
+# It enumerates unshipped work and known weaknesses; that belongs in private
+# notes, not in the public standard.
+TAP-TODO.md
