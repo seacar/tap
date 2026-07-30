@@ -1,5 +1,5 @@
 /**
- * TAP-aware server middleware — server-attested provenance (TAP-spec §6).
+ * TAP-aware server middleware — server-attested provenance ([TAP-EVT-ENVELOPE]).
  * Verifies inbound passports, enforces scope/policy before execute, signs execution legs.
  */
 import canonicalize from "canonicalize";

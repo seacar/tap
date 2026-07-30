@@ -12,7 +12,7 @@ import {
   type PostFn,
 } from "./server.js";
 
-/** TAP HTTP carriage headers (TAP-spec §10.1). */
+/** TAP HTTP carriage headers (spec §11.1). */
 export const TAP_PASSPORT_HEADER = "X-Agent-Passport";
 export const TAP_ACTION_REF_HEADER = "X-TAP-Action-Ref";
 

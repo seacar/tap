@@ -139,12 +139,12 @@ export interface Jwk {
   revoked_at?: number;
 }
 
-// --- crypto-suite dispatch & revocation (spec §3.2, §3.6, §15) ---------------
+// --- crypto-suite dispatch & revocation [TAP-SUITE-DISPATCH], [TAP-KEY-REVOCATION] ---------------
 
 /**
  * The key declares a crypto suite this implementation does not recognize.
  * A conforming verifier MUST reject it rather than fall back to a default
- * (spec §15) — verification dispatches off the key's declared suite so that
+ * ([TAP-SUITE-DISPATCH]) — verification dispatches off the key's declared suite so that
  * future suites need no verifier rewrite.
  */
 export class UnknownSuite extends Error {
@@ -164,11 +164,54 @@ export function suiteForJwk(jwk: Partial<Jwk>): string {
   return suite;
 }
 
-/** Optional epoch-seconds revocation boundary for a key (spec §3.2). */
+/** Optional epoch-seconds revocation boundary for a key [TAP-KEY-REVOCATION]. */
 export function keyRevokedAt(jwk: Partial<Jwk>): number | null {
   return jwk.revoked_at === undefined || jwk.revoked_at === null
     ? null
     : Number(jwk.revoked_at);
+}
+
+/** The signing key's revocation boundary excludes this record [TAP-KEY-REVOCATION]. */
+export class RevokedKey extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "RevokedKey";
+  }
+}
+
+/** RFC 3339 UTC timestamp -> epoch seconds. NaN when unparseable. */
+export function parseTs(ts: string): number {
+  return Math.floor(Date.parse(ts) / 1000);
+}
+
+/**
+ * Enforce a key's revocation boundary against the record's own timestamp
+ * [TAP-KEY-REVOCATION].
+ *
+ * `signedAt` is an Event's `ts` or a Passport's `iat`. Both live INSIDE the
+ * signing input, so a holder of a compromised key cannot backdate a record past
+ * the boundary without breaking its signature — which is what makes this check
+ * sound before the signature has been verified.
+ *
+ * Revocation is an effective-time boundary, not blanket repudiation: records
+ * signed before it stay valid, or retiring a key would retroactively destroy
+ * every record it ever signed. A record that cannot place itself in time, under a
+ * key that IS revoked, is rejected: evidence that cannot prove its own effective
+ * time is not evidence.
+ */
+export function checkNotRevoked(jwk: Partial<Jwk>, signedAt: string | number | undefined): void {
+  const revoked = keyRevokedAt(jwk);
+  if (revoked === null) return;
+  if (signedAt === undefined || signedAt === null) {
+    throw new RevokedKey("key is revoked and the record carries no timestamp to place it");
+  }
+  const at = typeof signedAt === "number" ? signedAt : parseTs(signedAt);
+  if (!Number.isFinite(at)) {
+    throw new RevokedKey("key is revoked and the record timestamp is unparseable");
+  }
+  if (at >= revoked) {
+    throw new RevokedKey(`key revoked at ${revoked}; record is timestamped ${at}`);
+  }
 }
 
 const CROCKFORD = "0123456789ABCDEFGHJKMNPQRSTVWXYZ";
@@ -182,11 +225,20 @@ function b32(value: number, length: number): string {
   return out;
 }
 
-/** Crockford base32 id with prefix, e.g. ``key_01H...`` */
+/**
+ * Crockford base32 id with prefix, e.g. ``evt_01H...``
+ *
+ * The random half comes from `crypto.getRandomValues`, not `Math.random`: these
+ * identifiers become `event_id`s and `action_ref`s, which correlate the two legs of
+ * an attested action and are committed to by checkpoint Merkle roots. Predictable
+ * identifiers let an attacker guess a slot before it is filled. The Python SDK has
+ * always used a CSPRNG here; this one had not.
+ */
 export function newId(prefix: string): string {
   const ts = b32(Date.now(), 10);
+  const bytes = crypto.getRandomValues(new Uint8Array(16));
   let rand = "";
-  for (let i = 0; i < 16; i++) rand += CROCKFORD[Math.floor(Math.random() * 32)];
+  for (let i = 0; i < 16; i++) rand += CROCKFORD[bytes[i] & 31];
   return `${prefix}_${ts}${rand}`;
 }
 
@@ -228,15 +280,63 @@ export async function verifyPassport(
   const claims = JSON.parse(new TextDecoder().decode(b64uToBytes(p)));
   if (header.typ !== PASSPORT_TYP) throw new Error("wrong token type");
   if (header.kid !== jwk.kid) throw new Error("kid mismatch");
-  const revoked = keyRevokedAt(jwk);
-  if (revoked !== null && (claims.iat as number) >= revoked)
-    throw new Error("key revoked as of iat");
+  checkNotRevoked(jwk, claims.iat as number);
+  // Freshness with the +/-60 s skew allowance, written as the spec's inequality so
+  // the two cannot drift apart [TAP-PASSPORT-VALIDATE].
   if (!((claims.iat as number) - 60 <= now && now < (claims.exp as number) + 60))
     throw new Error("passport expired / not yet valid");
   return claims;
 }
 
 // --- event (detached sig over JCS canonical body) ---------------------------
+
+/**
+ * No fractional numbers, and no integer outside the IEEE-754 safe range, anywhere
+ * in a signed body [TAP-CANON-NUMBERS].
+ *
+ * RFC 8785's number canonicalization is correct, but non-integer floating point is
+ * the single most common source of cross-language signature divergence, so TAP
+ * forbids it outright: fractional quantities travel as strings ("0.71"). This
+ * guard exists because the rule is only worth anything if a Signer REFUSES to sign
+ * a violating body — a TypeScript signer without it silently emitted records the
+ * specification forbids, which a Python verifier could still verify, leaving the
+ * divergence to surface later as a checkpoint that would not reconcile.
+ */
+export class CanonicalizationError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "CanonicalizationError";
+  }
+}
+
+const MAX_SAFE = Number.MAX_SAFE_INTEGER; // 2^53 - 1
+
+export function canonicalGuard(value: unknown, path = ""): void {
+  if (typeof value === "number") {
+    if (!Number.isFinite(value)) {
+      throw new CanonicalizationError(`non-finite number in a signed body at ${path || "<root>"}`);
+    }
+    if (!Number.isInteger(value)) {
+      throw new CanonicalizationError(
+        `fractional numbers are forbidden in a signed body (at ${path || "<root>"}); encode as a string`,
+      );
+    }
+    if (Math.abs(value) > MAX_SAFE) {
+      throw new CanonicalizationError(
+        `integer ${value} at ${path || "<root>"} exceeds the +/-(2^53-1) safe range`,
+      );
+    }
+    return;
+  }
+  if (value === null || typeof value !== "object") return;
+  if (Array.isArray(value)) {
+    value.forEach((v, i) => canonicalGuard(v, `${path}[${i}]`));
+    return;
+  }
+  for (const [k, v] of Object.entries(value as Record<string, unknown>)) {
+    canonicalGuard(v, `${path}.${k}`);
+  }
+}
 
 export function signingInput(body: Record<string, unknown>): Uint8Array {
   const { sig: _omit, ...rest } = body as Record<string, unknown>;
@@ -249,17 +349,35 @@ export async function signEvent<T extends Record<string, unknown>>(
   seedHex: string,
   body: T,
 ): Promise<T & { sig: string }> {
+  const { sig: _omit, ...rest } = body as Record<string, unknown>;
+  canonicalGuard(rest); // refuse to sign a body the spec forbids [TAP-CANON-NUMBERS]
   const sig = await ed.signAsync(signingInput(body), fromHex(seedHex));
   return { ...body, sig: b64u(sig) };
 }
 
-/** True when ``scope_used`` is authorized by the passport scope list (TAP-spec §8). */
+/**
+ * Exact-match scope check [TAP-SCOPE-MATCH].
+ *
+ * v0.1 matches scope tokens by exact string equality: no wildcards, no prefix rule,
+ * no case folding, and `read:database` does NOT cover `read:database.users`. This is
+ * the narrowest possible rule on purpose — a matching semantics that grants more
+ * than it literally says would be privilege escalation in the one check TAP performs
+ * itself. Richer schemes belong in a Service Profile.
+ */
 export function scopeSatisfied(scopeUsed: string | null | undefined, passportScope: string[]): boolean {
   return scopeUsed == null || passportScope.includes(scopeUsed);
 }
 
+/**
+ * Verify one Event [TAP-EVT-VERIFY].
+ *
+ * Suite dispatch and the revocation boundary are part of verification, not a layer
+ * above it: a primitive that skips either does not conform, however faithfully a
+ * caller might re-implement them elsewhere.
+ */
 export async function verifyEvent(jwk: Jwk, event: Record<string, unknown>): Promise<boolean> {
-  suiteForJwk(jwk); // dispatch off the declared suite; throws on unknown (§3.6, §15)
+  suiteForJwk(jwk); // dispatch off the declared suite; throws on unknown [TAP-SUITE-DISPATCH]
+  checkNotRevoked(jwk, event.ts as string | undefined);
   const ok = await ed.verifyAsync(
     b64uToBytes(event.sig as string),
     signingInput(event),

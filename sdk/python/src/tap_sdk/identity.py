@@ -14,8 +14,6 @@ import threading
 from dataclasses import dataclass
 from pathlib import Path
 
-import httpx
-
 from typing import Callable
 
 from .core import generate_signer, load_signer, new_id, public_jwk
@@ -112,6 +110,21 @@ def register_with_verifier(
             public_jwk_dict=public_jwk_dict,
             timeout=timeout,
         )
+    # Imported here, not at module scope: `httpx` is an OPTIONAL dependency, and
+    # this is the only code path in the package that needs it. A module-level
+    # import made `from tap_sdk import TAPClient` fail outright on a default
+    # install — signing and verifying need no network, and a relying party
+    # re-verifying an archived transcript should not have to install an HTTP
+    # client to do it.
+    try:
+        import httpx
+    except ImportError as exc:  # pragma: no cover - environment-dependent
+        raise ImportError(
+            "auto-registering an agent identity needs the optional HTTP extra: "
+            "pip install 'traceable-agent-protocol[http]'. Alternatively pass "
+            "`post=` to supply your own registration transport."
+        ) from exc
+
     headers: dict[str, str] = {}
     if api_key:
         headers["X-API-Key"] = api_key

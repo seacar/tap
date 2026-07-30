@@ -34,7 +34,7 @@ RESULT_CODES = frozenset({
     "TIMEOUT", "UPSTREAM_4XX", "UPSTREAM_5XX", "VALIDATION_ERROR",
 })
 
-# Action taxonomy — TAP-spec §6.2. Implementations MAY define namespaced
+# Action taxonomy — [TAP-EVT-KIND]. Implementations MAY define namespaced
 # extension kinds prefixed ``x-``; verifiers MUST preserve unknown kinds
 # verbatim, so this set is a reference for validation, never a filter.
 ACTION_KINDS = frozenset({
@@ -42,7 +42,7 @@ ACTION_KINDS = frozenset({
     "denied", "decision", "checkpoint",
 })
 
-# --- canonicalization guard (TAP-spec §3.4) -----------------------------------
+# --- canonicalization guard ([TAP-CANON-NUMBERS]) -----------------------------------
 
 MAX_SAFE_INT = 2**53 - 1
 
@@ -117,14 +117,24 @@ def public_jwk(sk: Ed25519PrivateKey, kid: str) -> dict:
             "use": "sig", "kid": kid, "x": b64u(raw)}
 
 
-# --- crypto-suite dispatch & revocation (spec §3.2, §3.6, §15) ---------------
+# --- crypto-suite dispatch & revocation [TAP-SUITE-DISPATCH], [TAP-KEY-REVOCATION] ---------------
+
+
+class RevokedKey(ValueError):
+    """The signing key's revocation boundary excludes this record.
+
+    A distinct type from UnknownSuite so a caller can tell "this key was retired"
+    from "this key speaks a suite I do not implement" — different operational
+    responses, and only the first says anything about the record's authenticity
+    at the time it was signed.
+    """
 
 
 class UnknownSuite(ValueError):
     """The key declares a crypto suite this implementation does not recognize.
 
     A conforming verifier MUST reject it rather than fall back to a default
-    (spec §15). New suites are registry additions, never silent widening.
+    ([TAP-SUITE-DISPATCH]). New suites are registry additions, never silent widening.
     """
 
 
@@ -144,9 +154,41 @@ def suite_for_jwk(jwk: dict) -> str:
 
 
 def key_revoked_at(jwk: dict) -> int | None:
-    """Optional epoch-seconds revocation boundary for a key (spec §3.2)."""
+    """Optional epoch-seconds revocation boundary for a key [TAP-KEY-REVOCATION]."""
     revoked_at = jwk.get("revoked_at")
     return int(revoked_at) if revoked_at is not None else None
+
+
+def parse_ts(ts: str) -> int:
+    """RFC 3339 UTC timestamp -> epoch seconds. Raises on anything unparseable."""
+    return int(datetime.fromisoformat(ts.replace("Z", "+00:00")).timestamp())
+
+
+def check_not_revoked(jwk: dict, signed_at: str | int | None) -> None:
+    """Enforce a key's revocation boundary against the record's own timestamp
+    [TAP-KEY-REVOCATION].
+
+    ``signed_at`` is an Event's ``ts`` (RFC 3339) or a Passport's ``iat`` (epoch
+    seconds). Both are INSIDE the signing input, so a holder of a compromised key
+    cannot backdate a record past the boundary without breaking its signature —
+    which is what makes this check sound before the signature is verified.
+
+    Revocation is an effective-time boundary, not blanket repudiation: records
+    signed before ``revoked_at`` stay valid. A record that cannot place itself in
+    time, signed by a key that IS revoked, is rejected — evidence that cannot
+    prove its own effective time is not evidence.
+    """
+    revoked = key_revoked_at(jwk)
+    if revoked is None:
+        return
+    if signed_at is None:
+        raise RevokedKey("key is revoked and the record carries no timestamp to place it")
+    try:
+        at = signed_at if isinstance(signed_at, int) else parse_ts(signed_at)
+    except Exception as exc:
+        raise RevokedKey(f"key is revoked and the record timestamp is unparseable: {exc}")
+    if at >= revoked:
+        raise RevokedKey(f"key revoked at {revoked}; record is timestamped {at}")
 
 
 # --- passport (compact JWS / JWT) --------------------------------------------
@@ -161,6 +203,7 @@ def sign_passport(sk: Ed25519PrivateKey, kid: str, claims: dict) -> str:
 
 
 def verify_passport(jwk: dict, token: str, now: int | None = None) -> dict:
+    """Validate a Passport [TAP-PASSPORT-VALIDATE]."""
     suite_for_jwk(jwk)  # dispatch off the declared suite; raises on unknown
     now = int(time.time()) if now is None else now
     h_b64, p_b64, s_b64 = token.split(".")
@@ -170,8 +213,9 @@ def verify_passport(jwk: dict, token: str, now: int | None = None) -> dict:
     claims = json.loads(b64u_dec(p_b64))
     assert header["typ"] == PASSPORT_TYP, "wrong token type"
     assert header["kid"] == jwk["kid"], "kid mismatch"
-    revoked = key_revoked_at(jwk)
-    assert revoked is None or claims["iat"] < revoked, "key revoked as of iat"
+    check_not_revoked(jwk, claims.get("iat"))
+    # Freshness with the +/-60 s skew allowance, written as the spec's inequality
+    # so the two cannot drift apart [TAP-PASSPORT-VALIDATE].
     assert claims["iat"] - 60 <= now < claims["exp"] + 60, "passport expired / not yet valid"
     return claims
 
@@ -190,7 +234,14 @@ def sign_event(sk: Ed25519PrivateKey, event_body: dict) -> dict:
 
 
 def verify_event(jwk: dict, event: dict) -> bool:
+    """Verify one Event [TAP-EVT-VERIFY].
+
+    Suite dispatch and the revocation boundary are part of verification, not a
+    layer above it: a primitive that skips either does not conform, however
+    faithfully a caller might re-implement them elsewhere.
+    """
     suite_for_jwk(jwk)  # dispatch off the declared suite; raises on unknown
+    check_not_revoked(jwk, event.get("ts"))
     pk = Ed25519PublicKey.from_public_bytes(b64u_dec(jwk["x"]))
     pk.verify(b64u_dec(event["sig"]), signing_input(event))
     assert event["kid"] == jwk["kid"], "kid mismatch"
@@ -265,4 +316,13 @@ def checkpoint_root(event_ids: list[str]) -> str:
 
 
 def scope_satisfied(scope_used: str | None, passport_scope: list[str]) -> bool:
+    """Exact-match scope check [TAP-SCOPE-MATCH].
+
+    v0.1 matches scope tokens by exact string equality: no wildcards, no prefix
+    rule, no case folding, and `read:database` does NOT cover
+    `read:database.users`. This is the narrowest possible rule on purpose — a
+    matching semantics that grants more than it literally says would be a
+    privilege-escalation surface in the one check TAP performs itself. Richer
+    schemes belong in a Service Profile.
+    """
     return scope_used is None or scope_used in passport_scope

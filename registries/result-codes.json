@@ -1,0 +1,64 @@
+{
+  "_about": "TAP result-code registry. Machine-readable form of TAP-spec-v0.1.md \u00a710 [TAP-RESULT-CODES]. Implementations MAY add namespaced codes as `x.<vendor>.<code>`; Verifiers MUST preserve unknown codes verbatim and MUST NOT coerce them to a known value.",
+  "_spec_version": "0.1.2",
+  "_extension_pattern": "^x\\.[a-z0-9-]+\\.[A-Za-z0-9_-]+$",
+  "codes": [
+    {
+      "code": "OK",
+      "meaning": "action completed successfully",
+      "status": [
+        "success"
+      ]
+    },
+    {
+      "code": "DENIED_SCOPE",
+      "meaning": "scope_used is not authorized by the Passport scope \u2014 drift",
+      "status": [
+        "denied"
+      ]
+    },
+    {
+      "code": "DENIED_POLICY",
+      "meaning": "denied by an explicit policy rule",
+      "status": [
+        "denied"
+      ]
+    },
+    {
+      "code": "TOOL_ERROR",
+      "meaning": "the tool or target agent raised an error",
+      "status": [
+        "failure"
+      ]
+    },
+    {
+      "code": "TIMEOUT",
+      "meaning": "action exceeded its deadline",
+      "status": [
+        "failure"
+      ]
+    },
+    {
+      "code": "UPSTREAM_4XX",
+      "meaning": "upstream rejected the request",
+      "status": [
+        "failure"
+      ]
+    },
+    {
+      "code": "UPSTREAM_5XX",
+      "meaning": "upstream failed to process the request",
+      "status": [
+        "failure"
+      ]
+    },
+    {
+      "code": "VALIDATION_ERROR",
+      "meaning": "request or arguments were malformed",
+      "status": [
+        "failure",
+        "denied"
+      ]
+    }
+  ]
+}

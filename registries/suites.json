@@ -1,0 +1,40 @@
+{
+  "_about": "TAP cryptographic suite registry. Machine-readable form of TAP-spec-v0.1.md \u00a73.6 [TAP-SUITE-DISPATCH]. A Verifier MUST dispatch off the key's declared suite and MUST reject any suite absent from its own registry rather than falling back to a default.",
+  "_spec_version": "0.1.2",
+  "suites": [
+    {
+      "id": "tap-ed25519",
+      "algorithm": "Ed25519",
+      "reference": "RFC 8032",
+      "jose": {
+        "alg": "EdDSA",
+        "crv": "Ed25519",
+        "kty": "OKP"
+      },
+      "status": "required",
+      "since": "tap/0.1",
+      "signature_bytes": 64,
+      "notes": "The only suite implemented in v0.1."
+    },
+    {
+      "id": "tap-ml-dsa-65",
+      "algorithm": "ML-DSA-65",
+      "reference": "FIPS 204",
+      "jose": null,
+      "status": "reserved",
+      "since": null,
+      "signature_bytes": 3309,
+      "notes": "Post-quantum, lattice. Reserved: no implementation exists. Signatures are ~50x Ed25519's, so they MUST ride in the body or _meta, never an HTTP header."
+    },
+    {
+      "id": "tap-slh-dsa-128s",
+      "algorithm": "SLH-DSA-128s",
+      "reference": "FIPS 205",
+      "jose": null,
+      "status": "reserved",
+      "since": null,
+      "signature_bytes": 7856,
+      "notes": "Post-quantum, hash-based; conservative archival choice. Reserved: no implementation exists."
+    }
+  ]
+}

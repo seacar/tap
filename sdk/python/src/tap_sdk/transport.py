@@ -1,7 +1,7 @@
-"""Async, buffered, fail-open event transport (MVP build spec §6).
+"""Async, buffered, fail-open event transport (spec §11.3).
 
 The Signer MUST NOT block the agent's hot path on reporting availability
-(TAP-spec §10.3). Signing happens on the calling thread (cheap with Ed25519);
+(spec §11.3). Signing happens on the calling thread (cheap with Ed25519);
 only the network POST is deferred. A single background thread drains a bounded
 queue and POSTs batches of up to ``batch_size`` events, or every
 ``flush_interval_s`` seconds — whichever comes first. If the Verifier is down,
@@ -53,7 +53,11 @@ class EventReporter:
         self._headers: dict[str, str] = {"X-API-Key": api_key} if api_key else {}
         self._batch_size = batch_size
         self._flush_interval = flush_interval_s
-        self._q: queue.Queue[dict] = queue.Queue(maxsize=max_buffer)
+        # Each item is an (event, annex | None) pair. The annex is the unsigned
+        # plaintext companion to a digest-only signed body [TAP-EVT-ANNEX]; it
+        # rides in the same batch so the Verifier can index it without a second
+        # round-trip, and can be shredded later without touching the signed chain.
+        self._q: queue.Queue[tuple[dict, dict | None]] = queue.Queue(maxsize=max_buffer)
         self._passport_jwt: str | None = None
         self._stop = threading.Event()
         self.dropped = 0  # overflow counter (surfaced for diagnostics)
@@ -65,20 +69,20 @@ class EventReporter:
         record drift checks (its scope is needed). Sent alongside the next batch."""
         self._passport_jwt = compact_jwt
 
-    def submit(self, event: dict) -> None:
+    def submit(self, event: dict, annex: dict | None = None) -> None:
         try:
-            self._q.put_nowait(event)
+            self._q.put_nowait((event, annex))
         except queue.Full:
             # Drop oldest, keep newest — never block the agent.
             try:
                 self._q.get_nowait()
                 self.dropped += 1
-                self._q.put_nowait(event)
+                self._q.put_nowait((event, annex))
             except queue.Empty:
                 pass
 
-    def _drain(self, limit: int) -> list[dict]:
-        batch: list[dict] = []
+    def _drain(self, limit: int) -> list[tuple[dict, dict | None]]:
+        batch: list[tuple[dict, dict | None]] = []
         while len(batch) < limit:
             try:
                 batch.append(self._q.get_nowait())
@@ -86,8 +90,11 @@ class EventReporter:
                 break
         return batch
 
-    def _send(self, batch: list[dict]) -> None:
-        payload: dict = {"events": batch}
+    def _send(self, batch: list[tuple[dict, dict | None]]) -> None:
+        payload: dict = {"events": [ev for ev, _ in batch]}
+        annexes = [ax for _, ax in batch if ax is not None]
+        if annexes:
+            payload["annexes"] = annexes  # spec §11.3
         if self._passport_jwt:
             payload["passport"] = self._passport_jwt
         try:
@@ -95,8 +102,8 @@ class EventReporter:
         except Exception:
             # Re-queue (best effort) and try again next tick. Fail-open: the
             # agent keeps running regardless of Verifier availability.
-            for ev in batch:
-                self.submit(ev)
+            for pair in batch:
+                self.submit(*pair)
 
     def _run(self) -> None:
         while not self._stop.is_set():

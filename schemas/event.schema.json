@@ -1,0 +1,140 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/traceable-agent-protocol/tap/schemas/event.schema.json",
+  "title": "TAP Event",
+  "description": "A signed, tamper-evident record of one agent action. Normative definition: TAP-spec-v0.1.md [TAP-EVT-ENVELOPE]. This schema is a convenience for implementers and tooling; where it and the specification disagree, the specification governs.\n\nTwo rules this schema encodes that are easy to miss:\n\n1. Absent optional fields are OMITTED, never null [TAP-EVT-OMIT] — `null` and absent are different signed bytes, so two Signers that disagree here produce structurally different events for logically identical actions. `additionalProperties` stays true (extensions are allowed), but the optional fields below are deliberately NOT nullable.\n2. No fractional numbers anywhere in a signed body [TAP-CANON-NUMBERS]. JSON Schema cannot express 'no non-integer number anywhere', so integer-typed fields are constrained individually and quantities that are conceptually fractional (a decision `score`) are typed as strings.",
+  "type": "object",
+  "required": ["v", "event_id", "passport_jti", "aid", "cid", "seq", "ts", "action", "result", "attestor", "kid", "sig"],
+  "properties": {
+    "v": { "const": "tap/0.1", "description": "Wire version. Negotiated per [TAP-NEGOTIATE]." },
+    "event_id": { "type": "string", "minLength": 1, "description": "Unique, sortable. Committed to by checkpoint Merkle roots, so it MUST come from a CSPRNG." },
+    "passport_jti": { "type": "string", "minLength": 1 },
+    "aid": { "type": "string", "minLength": 1, "description": "Agent instance id, unique per record." },
+    "cid": { "$ref": "#/$defs/digest" },
+    "seq": { "type": "integer", "minimum": 1, "maximum": 9007199254740991, "description": "1-based, monotonic per aid. Gaps and duplicates are integrity signals [TAP-EVT-SEQ]." },
+    "ts": { "type": "string", "format": "date-time", "pattern": "^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}\\.\\d{3}Z$", "description": "RFC 3339 UTC, milliseconds. Inside the signed body, so it also bounds key revocation [TAP-KEY-REVOCATION]." },
+
+    "action": {
+      "type": "object",
+      "required": ["kind"],
+      "properties": {
+        "kind": { "$ref": "#/$defs/actionKind" },
+        "intent_digest": { "$ref": "#/$defs/digest", "description": "OPTIONAL — omit when absent. A checkpoint action carries none." },
+        "tool": { "type": ["string", "null"], "description": "NULLABLE and always present: tool name, target agent id, or null where the action has no target." },
+        "scope_used": { "type": ["string", "null"], "description": "NULLABLE and always present. Matched against Passport scope by EXACT string equality [TAP-SCOPE-MATCH]." },
+        "args_digest": { "$ref": "#/$defs/digest", "description": "OPTIONAL — omit when absent. SHA-256 over the JCS-canonical args." }
+      },
+      "additionalProperties": true
+    },
+
+    "evidence": {
+      "type": "object",
+      "description": "OPTIONAL — omit entirely when empty, never send as null.",
+      "properties": {
+        "reasoning_digest": { "$ref": "#/$defs/digest" },
+        "model_output_digest": { "$ref": "#/$defs/digest" },
+        "nego": {
+          "type": "object",
+          "description": "The observed handshake outcome, bound into the FIRST Event of a record where a handshake occurred, and omitted where none did [TAP-NEGO-BINDING].",
+          "required": ["version", "suite", "attestation"],
+          "properties": {
+            "version": { "type": "string" },
+            "suite": { "type": "string", "description": "A TAP suite id from registries/suites.json — NOT a JOSE `alg` value." },
+            "attestation": { "enum": ["none", "server"] }
+          },
+          "additionalProperties": false
+        }
+      },
+      "additionalProperties": true
+    },
+
+    "result": {
+      "type": "object",
+      "required": ["status", "code", "error"],
+      "properties": {
+        "status": { "enum": ["success", "failure", "denied"] },
+        "code": { "type": "string", "description": "From registries/result-codes.json, or a namespaced `x.<vendor>.<code>`. Verifiers MUST preserve unknown codes verbatim [TAP-RESULT-CODES]." },
+        "latency_ms": { "type": "integer", "minimum": 0, "maximum": 9007199254740991, "description": "OPTIONAL — omit when not measured. Integer: no fractional numbers in a signed body." },
+        "error": { "type": ["string", "null"], "description": "NULLABLE and always present: null means 'no error', which is a value rather than an absence." },
+        "result_digest": { "$ref": "#/$defs/digest" }
+      },
+      "additionalProperties": true
+    },
+
+    "attestor": { "enum": ["agent", "server"], "description": "Who signed: intent, or execution [TAP-ASSURANCE]." },
+    "action_ref": { "type": "string", "description": "OPTIONAL — correlates the agent and server legs of one action." },
+    "parent_event_id": { "type": "string", "description": "OPTIONAL — omit when absent. Links a received_delegation to its agent_delegate." },
+
+    "policy_decision": {
+      "type": "object",
+      "description": "OPTIONAL — omit when absent [TAP-POLICY-RECORD].",
+      "required": ["decision"],
+      "properties": {
+        "decision": { "enum": ["allow", "deny"] },
+        "rule_id": { "type": "string" },
+        "policy_version": { "$ref": "#/$defs/digest", "description": "Digest over the canonical policy set in force — lets an auditor prove WHICH policy governed a historical action." }
+      },
+      "additionalProperties": true
+    },
+
+    "decision": { "$ref": "#/$defs/decisionBlock" },
+    "checkpoint": { "$ref": "#/$defs/checkpointBlock" },
+
+    "kid": { "type": "string", "minLength": 1, "description": "Inside the signed body, so it cannot be swapped without breaking the signature." },
+    "sig": { "$ref": "#/$defs/base64url", "description": "base64url(Ed25519 over JCS(body without sig))." }
+  },
+  "additionalProperties": true,
+
+  "$defs": {
+    "digest": { "type": "string", "pattern": "^sha256:[0-9a-f]{64}$", "description": "Self-describing digest string, lowercase hex." },
+    "base64url": { "type": "string", "pattern": "^[A-Za-z0-9_-]+$", "description": "base64url without padding (RFC 7515 §2)." },
+    "actionKind": {
+      "type": "string",
+      "description": "One of the registered kinds, or a namespaced `x-` extension. Verifiers MUST preserve unknown kinds verbatim [TAP-EVT-KIND].",
+      "anyOf": [
+        { "enum": ["tool_call", "agent_delegate", "received_delegation", "agent_message", "denied", "decision", "checkpoint"] },
+        { "pattern": "^x-[A-Za-z0-9._-]+$" }
+      ]
+    },
+    "decisionBlock": {
+      "type": "object",
+      "description": "The counterfactual ledger [TAP-EVT-DECISION]: the option taken AND the options rejected, with reasons, all inside the signing input so the option set cannot be revised after the fact.",
+      "required": ["question_digest", "chosen", "options", "options_digest"],
+      "properties": {
+        "question_digest": { "$ref": "#/$defs/digest" },
+        "chosen": { "type": "string", "description": "MUST equal the id of the one option with chosen: true." },
+        "selection": { "type": "string" },
+        "options": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "type": "object",
+            "required": ["id", "chosen"],
+            "properties": {
+              "id": { "type": "string" },
+              "chosen": { "type": "boolean" },
+              "score": { "type": "string", "description": "A STRING, e.g. \"0.71\" — fractional numbers are forbidden in a signed body [TAP-CANON-NUMBERS]." },
+              "rationale_digest": { "$ref": "#/$defs/digest" },
+              "reason_digest": { "$ref": "#/$defs/digest" }
+            },
+            "additionalProperties": true
+          }
+        },
+        "options_digest": { "$ref": "#/$defs/digest" }
+      },
+      "additionalProperties": true
+    },
+    "checkpointBlock": {
+      "type": "object",
+      "description": "Seals a segment of the record [TAP-EVT-CHECKPOINT]. The interval is half-open and SELF-DESCRIBING: (from_seq, through_seq], so a Verifier can reconcile one checkpoint without reconstructing the state of whichever checkpoint preceded it.",
+      "required": ["from_seq", "through_seq", "event_id_root", "count"],
+      "properties": {
+        "from_seq": { "type": "integer", "minimum": 0, "description": "EXCLUSIVE lower bound; 0 for the first checkpoint of a record." },
+        "through_seq": { "type": "integer", "minimum": 0, "description": "INCLUSIVE upper bound." },
+        "event_id_root": { "$ref": "#/$defs/digest", "description": "Merkle root over the event_ids in the interval, ordered by seq ascending." },
+        "count": { "type": "integer", "minimum": 0, "description": "MUST equal the number of event_ids committed by event_id_root." }
+      },
+      "additionalProperties": true
+    }
+  }
+}

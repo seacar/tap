@@ -2,9 +2,11 @@
 
 ### An Open Standard for Cryptographically Verifiable Agent Provenance
 
-**Status:** Whitepaper · Companion to TAP Specification v0.1 · **Version:** 0.1.1 · **Date:** 2026-07-22
+**Status:** Whitepaper · Companion to TAP Specification v0.1 · **Version:** 0.1.2 · **Date:** 2026-07-30
 **License (intended):** Apache-2.0 (specification + reference code)
 **Reference implementation:** `tap_ref.py` · **Conformance contract:** `test-vectors.json`
+
+> **This document is explanatory, not normative.** It exists to explain *why* TAP is shaped the way it is. Every normative rule lives in **`TAP-spec-v0.1.md`**, which governs wherever the two disagree, and in `test-vectors.json`, which governs the signed bytes. Section numbering here is independent of the specification's — cite the specification's stable `[TAP-…]` anchor tags, never a section number from this document.
 
 ---
 
@@ -185,7 +187,7 @@ Like MCP, TAP is a **negotiated** protocol. A Signer and TAP-aware Server agree 
 // Signer → Server (offered)
 "tap_hello": {
   "versions": ["tap/0.1"],
-  "algs": ["EdDSA"],
+  "suites": ["tap-ed25519"],
   "attestation": "requested",
   "kid": "key_2026_ref01"
 }
@@ -193,7 +195,7 @@ Like MCP, TAP is a **negotiated** protocol. A Signer and TAP-aware Server agree 
 // Server → Signer (selected)
 "tap_hello_ack": {
   "version": "tap/0.1",
-  "alg": "EdDSA",
+  "suite": "tap-ed25519",
   "attestation": "server",
   "checkpoints": "supported"
 }
@@ -201,7 +203,9 @@ Like MCP, TAP is a **negotiated** protocol. A Signer and TAP-aware Server agree 
 
 `attestation: "server"` tells the Signer the upstream will emit execution Events (two-sided assurance available); `attestation: "none"` means intent-only. If no mutually supported version exists, the parties fall back to unattested operation.
 
-**Anti-downgrade.** Because the handshake is not signed, a network intermediary could strip it to force silent downgrade. To detect this, the Signer MUST bind the negotiated outcome — selected `version`, suite, and `attestation` level — into the first Event it signs, as a `nego` object under `evidence`. A verifier compares the claimed negotiation against what actually arrived; a missing server leg when `attestation:"server"` was recorded is flagged identically to a `conflicting` attestation.
+**Anti-downgrade.** Because the handshake is not signed, a network intermediary could strip it to force silent downgrade. To detect this, the Signer binds the negotiated outcome — selected `version`, `suite`, and `attestation` level — into the first Event it signs, as a `nego` object under `evidence`. A verifier compares the claimed negotiation against what actually arrived; a missing server leg when `attestation:"server"` was recorded is flagged identically to a `conflicting` attestation.
+
+The value bound must be the outcome the Signer *observed*, not an expectation an operator configured. Binding a configured expectation would make the check compare a claim against itself, which detects nothing — see `[TAP-NEGO-BINDING]`.
 
 ### 4.2 Adoption as a Gradient
 
@@ -324,15 +328,18 @@ A bare sequence gap is ambiguous: tampering (an Event was deleted) or benign los
 
 ```jsonc
 "checkpoint": {
+  "from_seq": 0,                // exclusive lower bound — the interval is self-describing
   "through_seq": 42,
-  "event_id_root": "sha256:…",  // Merkle root over event_ids in (prev_checkpoint, 42]
+  "event_id_root": "sha256:…",  // Merkle root over event_ids in (from_seq, 42]
   "count": 42
 }
 ```
 
 A verifier reconciles delivered Events against the latest checkpoint: an `event_id` in the Merkle commitment but never delivered is **provable deletion**, not benign loss. This turns "a gap is suspicious" into "a gap is provably malicious or provably benign," making fail-open reporting safe for integrity.
 
-**Merkle construction (normative).** Leaves: `SHA-256(0x00 ‖ utf8(event_id))`; interior nodes: `SHA-256(0x01 ‖ left ‖ right)`. Odd-count levels promote the final node unchanged. A root mismatch is an integrity failure MUST be surfaced, not silently ignored.
+**Merkle construction.** Leaves are `SHA-256(0x00 ‖ utf8(event_id))`, interior nodes `SHA-256(0x01 ‖ left ‖ right)`, and an odd-count level promotes the final node unchanged. A root mismatch is an integrity failure and must be surfaced, not silently ignored.
+
+The complete, normative construction — including the ordering rule, the self-describing `(from_seq, through_seq]` interval, the empty-interval root, and the distinction between a root mismatch and a *provable deletion* — is `[TAP-EVT-CHECKPOINT]` in the specification. It is stated there and only there, so that the two documents cannot drift into two subtly different Merkle trees.
 
 ### 6.4 Decision Events — The Counterfactual Ledger
 

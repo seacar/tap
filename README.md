@@ -32,10 +32,12 @@ An audit trail that only its vendor can verify isn't evidence. It's a receipt.
 
 ## Quickstart
 
+> **Not yet on PyPI or npm.** The package names below are reserved but unpublished, so install from this repository for now — `pip install ./sdk/python`, or `npm install ./sdk/js`. The published commands are shown because they are what the names will be; they are not what works today.
+
 ### Python
 
 ```bash
-pip install traceable-agent-protocol
+pip install ./sdk/python        # published as `traceable-agent-protocol`
 ```
 
 ```python
@@ -61,10 +63,19 @@ db_query("users", limit=50)             # signed automatically
 tap.emit_checkpoint()                   # seals the record
 ```
 
+Against a TAP-aware server or Gateway, negotiate first — that is what lets the record claim *two-sided* assurance honestly:
+
+```python
+ack = requests.post(url, headers=passport.http_headers(hello=tap.hello())).headers
+tap.negotiate(json.loads(ack["X-TAP-Hello-Ack"]))   # binds the OBSERVED outcome
+```
+
+If an intermediary strips the handshake, no ack comes back, nothing is bound, and the record degrades visibly to `intent-only` instead of claiming assurance nobody promised.
+
 ### TypeScript
 
 ```bash
-npm install @traceableagent/sdk
+npm install ./sdk/js            # published as `@traceableagent/sdk`
 ```
 
 ```ts
@@ -74,7 +85,9 @@ const tap = new TAPClient({ agentId: "support-triage", privateKeyHex: SEED, kid:
 const passport = await tap.issuePassport({ taskPrompt: "…", scope: ["read:database"] });
 ```
 
-Both SDKs reproduce [`test-vectors.json`](test-vectors.json) byte-for-byte from the same fixed seed. That is the property the whole protocol rests on: **a Signer and a Verifier in different languages cannot drift apart.**
+Both SDKs reproduce [`test-vectors.json`](test-vectors.json) byte-for-byte from the same fixed seed — including a canonicalization case built from non-BMP characters, NFC/NFD pairs and control-character escapes, because that is where RFC 8785 implementations actually diverge. CI additionally checks that the two SDKs **compose** identical bytes for the same logical action, not merely that each can re-sign a body the other composed.
+
+That is the property the whole protocol rests on: **a Signer and a Verifier in different languages cannot drift apart.**
 
 ---
 
@@ -90,6 +103,9 @@ Both SDKs reproduce [`test-vectors.json`](test-vectors.json) byte-for-byte from 
 | [`sdk/js/`](sdk/js) | `@traceableagent/sdk` — the same, in TypeScript |
 | [`gateway/`](gateway) | TAP-aware Gateway — adds server-side attestation in front of tools that have never heard of TAP |
 | [`inspector/`](inspector) | Local dev tool — mint test Passports, sign/verify Events, visualize a record's chain |
+| [`schemas/`](schemas) | JSON Schema for the Event, Passport claims, and annex |
+| [`registries/`](registries) | Machine-readable crypto-suite and result-code registries |
+| [`CHANGELOG.md`](CHANGELOG.md) | What changed, and which changes altered signed bytes |
 
 ---
 
@@ -99,7 +115,7 @@ Both SDKs reproduce [`test-vectors.json`](test-vectors.json) byte-for-byte from 
 
 **Two-sided attestation.** The agent signs *intent* ("I am calling `db_query`"). An independent server — or the Gateway, for upstreams that aren't TAP-aware — signs *execution* ("`db_query` ran and returned OK"). A compromised signer can lie about intent; it cannot forge the server's signature over what actually happened.
 
-**Signed checkpoints make fail-open safe.** Reporting never blocks your agent. Periodic signed Merkle checkpoints let a verifier tell the difference between *provable deletion* and *benign loss* — turning "this gap is suspicious" into "this gap is provably malicious or provably benign."
+**Signed checkpoints make fail-open safe.** Reporting never blocks your agent. Periodic signed Merkle checkpoints let a verifier tell the difference between *provable deletion* and *benign loss* — turning "this gap is suspicious" into "this gap is provably malicious or provably benign." Each checkpoint carries its own interval bounds, so it reconciles on its own even when an earlier one never arrived.
 
 And one deliberate constraint: **no fractional numbers in a signed body.** Float canonicalization is the single most common source of cross-language signature divergence. Scores and other fractional quantities are encoded as strings. The vectors include a fractional case to force the issue.
 
@@ -111,20 +127,45 @@ Three classes, defined in [spec §14](TAP-spec-v0.1.md):
 
 | Class | Must implement |
 |---|---|
-| **Signer** | Passport minting + renewal, Event signing over JCS, checkpoints, carriage, fail-open reporting |
+| **Signer** | Passport minting + renewal, Event signing over JCS, checkpoints, the handshake binding, carriage, fail-open reporting |
 | **Verifier** | Signature verification + suite dispatch + revocation, checkpoint reconciliation, chain join, replay defense, honest assurance labeling |
 | **TAP-aware Server / Gateway** | Handshake, Passport verification, server-attested Events echoing `action_ref`, replay cache |
 
-All classes must pass `test-vectors.json`. A conforming verifier **must reject any suite it does not recognize** rather than fall back to a default — verification dispatches off the key's declared suite, so future (including post-quantum) suites need no verifier rewrite.
+Passing `test-vectors.json` means passing **both halves**: reproducing every published signature byte-for-byte, *and* rejecting or flagging every case in its `negative` section. Reproduction alone establishes only that an implementation can sign like the reference — a verifier that accepted everything would pass it perfectly.
+
+### What each implementation here actually covers
+
+Conformance is claimed per class, and this repository's implementations do not all cover all three. Published so the gaps are visible rather than implied:
+
+| | Reference (`tap_ref.py`) | Python SDK | TypeScript SDK | Gateway |
+|---|---|---|---|---|
+| Sign Passports + Events | ✅ | ✅ | ✅ | ✅ (server leg) |
+| Digest-only body, omit-absent rule | ✅ | ✅ | ✅ | ✅ |
+| No-fractional-numbers guard | ✅ | ✅ | ✅ | ✅ |
+| Checkpoints (emit + seal) | ✅ | ✅ | ✅ | n/a |
+| Handshake + `nego` binding | n/a | ✅ | ✅ | ✅ (answers) |
+| Suite dispatch + revocation | ✅ | ✅ | ✅ | ✅ |
+| Passport validation | ✅ | ✅ | ✅ | ✅ |
+| Checkpoint reconciliation | ✅ | ✅ | ✅ | n/a |
+| Assurance labelling + chain join | ❌ | ✅ | ✅ | n/a |
+| Replay cache | n/a | n/a | n/a | ✅ |
+| **Signer class** | partial | ✅ | ✅ | n/a |
+| **Verifier class** | partial | ✅ | ✅ | n/a |
+| **Server/Gateway class** | ❌ | ✅ (`TAPServer`) | ✅ (`TAPServer`) | ✅ |
+
+`tap_ref.py` is deliberately partial: it is a readable definition of the wire crypto, not a product. Its job is to generate the vectors and to be short enough that you can check it by eye.
+
+### Running it
 
 ```bash
-# reference implementation — regenerates and self-checks the vectors
-python3 tap_ref.py
+# everything CI runs, locally
+./scripts/ci-local.sh
 
-# Python SDK
+# or piecemeal:
+python3 tap_ref.py                    # regenerate + self-check the vectors
+python3 scripts/check-spec-vectors.py # the spec's quoted values match the vectors
+python3 scripts/check-schemas.py      # the schemas describe the vectors
 cd sdk/python && PYTHONPATH=src python3 tests/test_conformance.py
-
-# TypeScript SDK
 cd sdk/js && npm install && npm test
 ```
 
@@ -142,9 +183,16 @@ TAP is also not a content filter, a risk-assessment framework, a bias evaluation
 
 ## Status
 
-**v0.1 — early.** The spec, reference implementation, conformance vectors, both SDKs, the Gateway and the Inspector all ship and are tested.
+**v0.1.2 — early.** The spec, reference implementation, conformance vectors, both SDKs, the Gateway and the Inspector all ship and are tested, and the two SDKs now compose byte-identical envelopes for the same logical action.
 
-Not yet built, and worth knowing before you depend on this: the Go SDK; the three-tier KMS/HSM key hierarchy of §3.5 (today every signer uses a single flat key, so treat signing keys as long-lived secrets); post-quantum suites, which are reserved in the registry but unimplemented; composite signatures; and RFC 3161 timestamp anchoring. The `nego` anti-downgrade binding (§4.1) ships in the Python SDK but not yet in TypeScript.
+v0.1.2 changed signed bytes on purpose, to fix places where the specification disagreed with its own reference implementation. If you built against v0.1.0, see [CHANGELOG.md](CHANGELOG.md) — the changed fields are listed individually.
+
+Not yet built, and worth knowing before you depend on this:
+
+- **No key hierarchy.** Every signer uses a single flat key. The three-tier KMS/HSM design in §3.5 is specified but unimplemented, so treat signing keys as long-lived secrets and protect them accordingly.
+- **No post-quantum suites.** `tap-ml-dsa-65` and `tap-slh-dsa-128s` are reserved in the registry with no implementation.
+- **No composite signatures** and **no RFC 3161 timestamp anchoring**.
+- **No third-language SDK.** A Go, Rust, or Java signer that reproduces the vectors is the single strongest validation the spec can get, and the surest way to find remaining ambiguities — two implementations by the same authors agree partly because they share assumptions.
 
 Open an issue if a gap blocks you — the roadmap is driven by what implementers actually hit.
 
@@ -155,6 +203,8 @@ Breaking changes are possible before v1.0. The wire format is versioned (`v: "ta
 ## Contributing
 
 Issues and PRs welcome — see [CONTRIBUTING.md](CONTRIBUTING.md). The one hard rule: **any change to signing or verification must be accompanied by regenerated test vectors and must pass both SDKs' conformance suites.** The vectors are the contract.
+
+Two conventions worth knowing before you read the code: comments cite the spec's stable `[TAP-…]` anchor tags rather than section numbers, which move and leave citations quietly wrong; and a change that adds a rule should add a *negative* vector for it, because a rule the vectors cannot fail is a rule nobody has to follow.
 
 For security issues, see [SECURITY.md](SECURITY.md) — please don't open a public issue.
 
