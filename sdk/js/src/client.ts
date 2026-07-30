@@ -1,5 +1,7 @@
-// The TAPClient signer SDK (TypeScript). Mints passports and signs provenance
-// events + the counterfactual decision ledger (TAP-spec §5.7).
+// The TAPClient signer SDK (TypeScript). Mints passports, negotiates the TAP
+// handshake, signs provenance events and the counterfactual decision ledger, and
+// seals records with checkpoints. See TAP-spec-v0.1.md; comments cite the spec's
+// stable [TAP-...] anchor tags rather than section numbers, which move.
 
 import {
   checkpointRoot,
@@ -12,6 +14,14 @@ import {
   signPassport,
   textDigest,
 } from "./tap.js";
+import {
+  helloHeaders,
+  offer,
+  readAck,
+  type Ack,
+  type Hello,
+  type Negotiated,
+} from "./negotiate.js";
 
 export interface TapCarriage {
   passport: string;
@@ -19,14 +29,23 @@ export interface TapCarriage {
   headers: Record<string, string>;
 }
 
-/** Passport carriage for HTTP transport (TAP-spec §10.1). */
-export function passportHttpHeaders(passport: Passport, actionRef?: string): Record<string, string> {
+/**
+ * Passport carriage for HTTP transport (spec §11.1). Sits alongside any
+ * `Authorization` header — TAP adds provenance, it does not replace access control.
+ * Pass `hello` on the first request of a session to carry the handshake.
+ */
+export function passportHttpHeaders(
+  passport: Passport,
+  actionRef?: string,
+  opts?: { hello?: Hello },
+): Record<string, string> {
   const headers: Record<string, string> = { "X-Agent-Passport": passport.compact };
   if (actionRef) headers["X-TAP-Action-Ref"] = actionRef;
+  if (opts?.hello) Object.assign(headers, helloHeaders(opts.hello));
   return headers;
 }
 
-/** Passport carriage for JSON-RPC ``_meta`` transport (TAP-spec §10.2). */
+/** Passport carriage for JSON-RPC `_meta` transport (spec §11.2). */
 export function passportMeta(passport: Passport, actionRef?: string): Record<string, unknown> {
   const tap: Record<string, unknown> = { passport: passport.compact };
   if (actionRef) tap.action_ref = actionRef;
@@ -40,7 +59,7 @@ export interface DecisionOption {
   id: string;
   /** Human-readable label for display (stored in annex only — not signed). */
   summary?: string;
-  /** Score MUST be a string per TAP-spec §3.4 (no fractional numbers in signed bodies). */
+  /** Score MUST be a string per [TAP-CANON-NUMBERS] (no fractional numbers in signed bodies). */
   score?: string;
   reason?: string;
   rationale?: string;
@@ -63,12 +82,24 @@ export interface TAPClientOptions {
 export interface Passport {
   compact: string;
   claims: Record<string, unknown>;
+  /**
+   * The observed handshake outcome, when there was one [TAP-NEGO-BINDING].
+   * Preferred over anything the caller configured, because it is evidence rather
+   * than intent. Absent means no usable ack arrived — which is exactly the state a
+   * stripped handshake produces, and the reason nothing gets bound.
+   */
+  negotiated?: Negotiated | null;
 }
 
 export class TAPClient {
   private opts: Required<Pick<TAPClientOptions, "endpoint" | "issuer">> & TAPClientOptions;
   private passport: Passport | null = null;
   private seq = 0;
+  private negoEmitted = false;
+  /** event_ids emitted since the last checkpoint, for the Merkle commitment. */
+  private eventIds: string[] = [];
+  private lastCpCount = 0;
+  private lastCpThroughSeq = 0;
   /** Each buffered item pairs the signed event with its optional plaintext annex (§6.1.1). */
   private buffer: { event: Record<string, unknown>; annex: Record<string, unknown> | null }[] = [];
 
@@ -102,8 +133,12 @@ export class TAPClient {
       meta,
     };
     const compact = await signPassport(this.opts.privateKeyHex, this.opts.kid, claims);
-    this.passport = { compact, claims };
+    this.passport = { compact, claims, negotiated: null };
     this.seq = 0;
+    this.negoEmitted = false;
+    this.eventIds = [];
+    this.lastCpCount = 0;
+    this.lastCpThroughSeq = 0;
     return this.passport;
   }
 
@@ -130,11 +165,13 @@ export class TAPClient {
     attestor?: string;
     /** Extra plaintext fields merged into the annex (e.g. decision question/options). */
     extraAnnex?: Record<string, unknown>;
+    parentEventId?: string;
+    policyDecision?: Record<string, unknown>;
   }): Promise<Record<string, unknown>> {
     const p = args.passport ?? this.requirePassport();
     const eventId = newId("evt");
 
-    // Digest-only action block — no plaintext in the signed body (TAP-spec §6.1)
+    // Digest-only action block — no plaintext in the signed body ([TAP-EVT-ENVELOPE])
     const action: Record<string, unknown> = {
       kind: args.kind,
       intent_digest: textDigest(args.intent),
@@ -163,33 +200,132 @@ export class TAPClient {
       Object.assign(annex, args.extraAnnex);
     }
 
+    // Bind the negotiated outcome into the FIRST Event of the record, once
+    // [TAP-NEGO-BINDING]. `nego` reflects the ack actually observed from the
+    // Server; when none was, nothing is bound and the record degrades honestly to
+    // intent-only rather than asserting assurance nobody promised.
+    if (p.negotiated && !this.negoEmitted) {
+      this.negoEmitted = true;
+      evidence.nego = {
+        version: p.negotiated.version,
+        suite: p.negotiated.suite,
+        attestation: p.negotiated.attestation,
+      };
+    }
+
+    const seq = ++this.seq;
+    const result: Record<string, unknown> = {
+      status: args.status ?? "success",
+      code: args.code ?? "OK",
+      // `error` is explicitly nullable — null means "no error", which is a value,
+      // not an absence [TAP-EVT-OMIT].
+      error: args.error ?? null,
+    };
+    if (args.latencyMs !== undefined && args.latencyMs !== null) {
+      result.latency_ms = args.latencyMs;
+    }
+
+    // Absent optional fields are OMITTED, never emitted as explicit nulls
+    // [TAP-EVT-OMIT]. `null` and absent are different signed bytes, so a TS signer
+    // that sent nulls produced structurally different events from the Python one
+    // for logically identical actions: both signatures verified, and their
+    // checkpoint roots disagreed.
     const body: Record<string, unknown> = {
       v: SPEC_VERSION,
       event_id: eventId,
       passport_jti: p.claims.jti,
       aid: p.claims.aid,
       cid: p.claims.cid,
-      seq: ++this.seq,
+      seq,
       ts: nowTs(),
       action,
-      evidence: Object.keys(evidence).length > 0 ? evidence : null,
-      result: {
-        status: args.status ?? "success",
-        code: args.code ?? "OK",
-        latency_ms: args.latencyMs ?? null,
-        error: args.error ?? null,
-      },
+      result,
       attestor: args.attestor ?? "agent",
       action_ref: args.actionRef ?? newId("act"),
-      parent_event_id: null,
-      policy_decision: null,
       kid: this.opts.kid,
     };
+    if (Object.keys(evidence).length > 0) body.evidence = evidence;
+    if (args.parentEventId) body.parent_event_id = args.parentEventId;
+    if (args.policyDecision) body.policy_decision = args.policyDecision;
     if (args.decision) body.decision = args.decision;
     const event = await signEvent(this.opts.privateKeyHex, body);
+    this.eventIds.push(eventId);
     // Only ship the annex when it has content beyond the event_id marker
     const hasAnnexContent = Object.keys(annex).length > 1;
     this.buffer.push({ event, annex: hasAnnexContent ? annex : null });
+    return event;
+  }
+
+  // --- handshake [TAP-NEGOTIATE] ---------------------------------------------
+
+  /**
+   * Build the `tap_hello` to send on the first request of a session. Carry it with
+   * `passportHttpHeaders(..., { hello })` or in `_meta.tap.hello`, then feed
+   * whatever comes back to {@link negotiate}.
+   */
+  hello(attestation: string = "requested"): Hello {
+    return offer({ kid: this.opts.kid, attestation });
+  }
+
+  /**
+   * Record the Server's `tap_hello_ack` against the current record.
+   *
+   * Returns the negotiated outcome, or null when no usable ack arrived — the case
+   * a stripped handshake produces. Callers need not branch on it: an unnegotiated
+   * record binds no `nego` and is labelled intent-only, which is the honest
+   * outcome [TAP-NEGO-BINDING].
+   */
+  negotiate(ack: unknown, passport?: Passport): Negotiated | null {
+    const p = passport ?? this.requirePassport();
+    const outcome = readAck(ack as Ack | null);
+    p.negotiated = outcome;
+    return outcome;
+  }
+
+  // --- checkpoints [TAP-EVT-CHECKPOINT] --------------------------------------
+
+  /**
+   * Seal the current record segment with a signed checkpoint.
+   *
+   * A Signer MUST emit one at the end of every record and SHOULD emit them
+   * periodically during long-running ones — it is what makes fail-open reporting
+   * safe, by letting a Verifier tell provable suppression from benign loss. The
+   * TypeScript SDK previously had no way to emit one at all, so a TS-signed record
+   * could never be sealed and every gap in it stayed permanently ambiguous.
+   *
+   * The interval is half-open and self-describing: `(from_seq, through_seq]`.
+   */
+  async emitCheckpoint(passport?: Passport): Promise<Record<string, unknown>> {
+    const p = passport ?? this.requirePassport();
+    const intervalIds = this.eventIds.slice(this.lastCpCount);
+    const fromSeq = this.lastCpThroughSeq;
+    const throughSeq = this.seq;
+    this.lastCpCount = this.eventIds.length;
+    this.lastCpThroughSeq = throughSeq;
+
+    const body: Record<string, unknown> = {
+      v: SPEC_VERSION,
+      event_id: newId("evt"),
+      passport_jti: p.claims.jti,
+      aid: p.claims.aid,
+      cid: p.claims.cid,
+      seq: ++this.seq,
+      ts: nowTs(),
+      // A checkpoint action has no intent and no args: those keys are omitted,
+      // not nulled [TAP-EVT-OMIT]. `tool` and `scope_used` are explicitly nullable.
+      action: { kind: "checkpoint", tool: null, scope_used: null },
+      checkpoint: {
+        from_seq: fromSeq,
+        through_seq: throughSeq,
+        event_id_root: checkpointRoot(intervalIds),
+        count: intervalIds.length,
+      },
+      result: { status: "success", code: "OK", error: null },
+      attestor: "agent",
+      kid: this.opts.kid,
+    };
+    const event = await signEvent(this.opts.privateKeyHex, body);
+    this.buffer.push({ event, annex: null }); // checkpoints carry no annex
     return event;
   }
 
@@ -316,7 +452,7 @@ export class TAPClient {
     });
   }
 
-  /** Record a decision AND the alternatives not taken (TAP-spec §6.4).
+  /** Record a decision AND the alternatives not taken ([TAP-EVT-DECISION]).
    *
    * The signed body carries only digests; plaintext question and option
    * rationale/reason go to the annex. Scores MUST be strings (§3.4).
@@ -387,7 +523,7 @@ export class TAPClient {
     });
   }
 
-  /** Flush buffered events (and their annexes) to the Verifier (TAP-spec §11.3). */
+  /** Flush buffered events (and their annexes) to the Verifier (spec §11.3). */
   async flush(): Promise<void> {
     if (this.buffer.length === 0) return;
     const items = this.buffer;

@@ -1,41 +1,55 @@
-# TAP — the Traceable Agent Protocol
+# TAP — Traceable Agent Protocol
 
-**An open standard for cryptographically verifiable agent provenance.**
+**Open evidence infrastructure for AI agents.**
 
-AI agents call tools, query databases, and delegate to one another — as black boxes. When an agent takes an unauthorized action or fails in a way that harms someone, there is no standard, tamper-evident way to establish *which* agent acted, *under what authority*, *with what reasoning*, and *with what result*. Application logs are mutable, unattributable to a decision, and unverifiable by anyone who wasn't already trusted.
+TAP is a vendor-neutral protocol for producing signed, portable, independently verifiable records of agent activity. It defines how an agent presents authority, how actions are linked into an evidence chain, how a server independently attests what it observed, and how a verifier evaluates the result.
 
-TAP fixes the evidence layer. Where MCP governs how an agent *obtains* context and *calls* tools, TAP governs the agent's *evidentiary record*:
+TAP is for developers, contributors, platform engineers, and security engineers. Managed-service features such as retention, reporting, tenant administration, and compliance workflows belong to [Sworn](https://getsworn.ai), not to this protocol.
 
-- a **Passport** — a signed credential asserting an agent's identity and authorized scope;
-- **Events** — signed, tamper-evident records of each action, carrying intent, reasoning, and result.
+## Start here
 
-Signatures are produced at the source and verifiable by any third party against a published public key. **No trust in the platform that stores them.** No blockchain.
+| Goal | Document |
+|---|---|
+| Learn the architecture | [Architecture and trust model](docs/architecture.md) |
+| Add TAP to an agent | [Getting started](docs/getting-started.md) |
+| Integrate a server or Gateway | [Integration guide](docs/integration-guide.md) |
+| Implement the wire format | [TAP specification v0.1](TAP-spec-v0.1.md) |
+| Understand the design rationale | [Whitepaper](TAP-whitepaper.md) |
+| Test an implementation | [Conformance guide](docs/conformance.md) |
+| Browse everything | [Documentation index](docs/README.md) |
 
+## The protocol in one minute
+
+```text
+agent
+  ├─ signed Passport: identity + presented authority
+  └─ signed Event: intent + action + result digests
+          │
+          ▼
+TAP-aware server or Gateway
+  └─ signed observed Event: what crossed the server boundary
+          │
+          ▼
+Verifier
+  └─ signatures + sequence + replay + checkpoints + assurance
 ```
-[ your agent ] → [ TAP SDK ] → signed events → [ any Verifier ]
-                      ↓                              ↓
-              tools / other agents          auditor re-verifies
-                                            with the public key alone
-```
 
----
+TAP separates three questions that ordinary logs blur together:
 
-## Why this exists
+1. **Who made the claim?** Signatures bind records to keys.
+2. **What authority was presented?** The Passport carries identity, scope, context, and validity.
+3. **What was independently observed?** A TAP-aware server or Gateway can sign the execution result and link it to the agent’s intent.
 
-Regulators moved the bar from *"do you have logs?"* to *"prove what the agent did."* The EU AI Act requires high-risk systems to keep traceable, attributable, retrievable logs under the deployer's control. NIST's AI Agent Standards Initiative names agent authorization and audit trails directly. Bank examiners now ask about agent governance as standard practice.
-
-Conventional logs fail that bar on four counts auditors specifically probe: they're **mutable**, **not attributable to a decision**, often **not under the accountable party's control**, and **unverifiable by a third party**.
-
-An audit trail that only its vendor can verify isn't evidence. It's a receipt.
-
----
+Readable payloads live in a redactable annex. The signed record carries digests, allowing evidence integrity to survive deletion of sensitive plaintext.
 
 ## Quickstart
+
+Packages are currently installed from this repository.
 
 ### Python
 
 ```bash
-pip install traceable-agent-protocol
+pip install ./sdk/python
 ```
 
 ```python
@@ -45,7 +59,7 @@ tap = TAPClient(
     agent_id="support-triage",
     private_key_hex=SEED,
     kid="key_2026_01",
-    endpoint="https://your-verifier.example.com",
+    endpoint="https://verifier.example.com",
 )
 
 passport = tap.issue_passport(
@@ -55,113 +69,96 @@ passport = tap.issue_passport(
 
 @tap.trace(tool="db_query", scope="read:database")
 def db_query(table, limit):
-    return run_query(table, limit)      # your existing code, unchanged
+    return run_query(table, limit)
 
-db_query("users", limit=50)             # signed automatically
-tap.emit_checkpoint()                   # seals the record
+db_query("users", limit=50)
+tap.emit_checkpoint()
 ```
 
 ### TypeScript
 
 ```bash
-npm install @traceableagent/sdk
+npm install ./sdk/js
 ```
 
 ```ts
 import { TAPClient } from "@traceableagent/sdk/agent";
 
-const tap = new TAPClient({ agentId: "support-triage", privateKeyHex: SEED, kid: "key_2026_01" });
-const passport = await tap.issuePassport({ taskPrompt: "…", scope: ["read:database"] });
+const tap = new TAPClient({
+  agentId: "support-triage",
+  privateKeyHex: seed,
+  kid: "key_2026_01",
+});
+
+const passport = await tap.issuePassport({
+  taskPrompt: "Resolve support ticket #8842",
+  scope: ["read:database"],
+});
 ```
 
-Both SDKs reproduce [`test-vectors.json`](test-vectors.json) byte-for-byte from the same fixed seed. That is the property the whole protocol rests on: **a Signer and a Verifier in different languages cannot drift apart.**
+See [Getting started](docs/getting-started.md) before using TAP in production.
 
----
+## Repository map
 
-## What's in this repo
-
-| Path | What it is |
+| Path | Purpose |
 |---|---|
-| [`TAP-spec-v0.1.md`](TAP-spec-v0.1.md) | The normative wire contract — crypto, canonicalization, Passport/Event formats, transport bindings, conformance rules |
-| [`TAP-whitepaper.md`](TAP-whitepaper.md) | The explanatory companion — design rationale, threat model, compliance context |
-| [`tap_ref.py`](tap_ref.py) | Reference implementation. Normative-by-example; it generates and self-checks the vectors |
-| [`test-vectors.json`](test-vectors.json) | **The conformance contract.** Every implementation must reproduce these signatures byte-for-byte |
-| [`sdk/python/`](sdk/python) | `traceable-agent-protocol` — signer, verifier, server leg, policy records |
-| [`sdk/js/`](sdk/js) | `@traceableagent/sdk` — the same, in TypeScript |
-| [`gateway/`](gateway) | TAP-aware Gateway — adds server-side attestation in front of tools that have never heard of TAP |
-| [`inspector/`](inspector) | Local dev tool — mint test Passports, sign/verify Events, visualize a record's chain |
-
----
-
-## Three design decisions worth knowing
-
-**Digests in the signed body; plaintext in a redactable annex.** The immutable record contains only SHA-256 digests of arguments, intent, and outputs. Human-readable text travels in a separate unsigned **annex** that can be stored encrypted and crypto-shredded. Delete the key and the personal data is gone while the signed chain still proves what was authorized and executed. This is how an immutable audit trail and a GDPR erasure obligation coexist.
-
-**Two-sided attestation.** The agent signs *intent* ("I am calling `db_query`"). An independent server — or the Gateway, for upstreams that aren't TAP-aware — signs *execution* ("`db_query` ran and returned OK"). A compromised signer can lie about intent; it cannot forge the server's signature over what actually happened.
-
-**Signed checkpoints make fail-open safe.** Reporting never blocks your agent. Periodic signed Merkle checkpoints let a verifier tell the difference between *provable deletion* and *benign loss* — turning "this gap is suspicious" into "this gap is provably malicious or provably benign."
-
-And one deliberate constraint: **no fractional numbers in a signed body.** Float canonicalization is the single most common source of cross-language signature divergence. Scores and other fractional quantities are encoded as strings. The vectors include a fractional case to force the issue.
-
----
+| [`docs/`](docs/) | Learning, onboarding, integration, conformance, and governance guides |
+| [`site/`](site/) | Dedicated TAP technical website |
+| [`TAP-spec-v0.1.md`](TAP-spec-v0.1.md) | Normative protocol contract |
+| [`TAP-whitepaper.md`](TAP-whitepaper.md) | Design rationale and threat model |
+| [`tap_ref.py`](tap_ref.py) | Readable reference implementation and vector generator |
+| [`test-vectors.json`](test-vectors.json) | Positive and negative interoperability contract |
+| [`sdk/python/`](sdk/python/) | Python signer, verifier, and server primitives |
+| [`sdk/js/`](sdk/js/) | TypeScript signer, verifier, and server primitives |
+| [`gateway/`](gateway/) | TAP-aware boundary for unchanged upstream services |
+| [`inspector/`](inspector/) | Local record inspection and debugging tool |
+| [`schemas/`](schemas/) | JSON Schemas |
+| [`registries/`](registries/) | Cryptographic suite and result-code registries |
 
 ## Conformance
 
-Three classes, defined in [spec §14](TAP-spec-v0.1.md):
+TAP defines three implementation classes:
 
-| Class | Must implement |
-|---|---|
-| **Signer** | Passport minting + renewal, Event signing over JCS, checkpoints, carriage, fail-open reporting |
-| **Verifier** | Signature verification + suite dispatch + revocation, checkpoint reconciliation, chain join, replay defense, honest assurance labeling |
-| **TAP-aware Server / Gateway** | Handshake, Passport verification, server-attested Events echoing `action_ref`, replay cache |
+- **Signer**
+- **Verifier**
+- **TAP-aware Server / Gateway**
 
-All classes must pass `test-vectors.json`. A conforming verifier **must reject any suite it does not recognize** rather than fall back to a default — verification dispatches off the key's declared suite, so future (including post-quantum) suites need no verifier rewrite.
+Claims are made per class and protocol version. Passing the positive vectors alone is not enough; a verifier must also reject or flag every applicable negative case.
+
+Run the full local suite:
 
 ```bash
-# reference implementation — regenerates and self-checks the vectors
-python3 tap_ref.py
-
-# Python SDK
-cd sdk/python && PYTHONPATH=src python3 tests/test_conformance.py
-
-# TypeScript SDK
-cd sdk/js && npm install && npm test
+./scripts/ci-local.sh
 ```
 
----
+Any change to signed bytes requires updated specification text, regenerated vectors, matching SDK changes, and a changelog entry.
 
-## What TAP does *not* do
+## Security and limitations
 
-Credibility here depends on not overclaiming.
+TAP proves authorship and integrity of signed claims. It does not prove that an agent is truthful, that an authorized action is appropriate, or that a deployment is compliant.
 
-TAP proves **authorship and integrity, not honesty.** It cannot establish that an agent's stated reasoning is its *real* reasoning, or stop a fully compromised signer from signing fluent lies. The structural answers are independent server attestation, model-output-bound counterfactuals, and a record any skeptical third party can check — but the limitation is real and permanent.
+Independent server attestation strengthens the record by separating agent intent from observed execution. It still proves only what crossed that attestation boundary.
 
-TAP is also not a content filter, a risk-assessment framework, a bias evaluation tool, or a guardrail engine. It records provenance and provides evidence. It does not, by itself, make any deployer "compliant" — documentation should say TAP *supports* or *provides evidence for* an obligation, never that it certifies anything.
+Read [SECURITY.md](SECURITY.md) before deployment and use its private reporting path for vulnerabilities.
 
----
+## Project status
 
-## Status
+Current protocol release: **v0.1.4**.
 
-**v0.1 — early.** The spec, reference implementation, conformance vectors, both SDKs, the Gateway and the Inspector all ship and are tested.
+The specification, reference implementation, test vectors, Python and TypeScript SDKs, Gateway, and Inspector are available. Breaking changes remain possible before v1.0. See [CHANGELOG.md](CHANGELOG.md) for signed-byte changes and migration notes.
 
-Not yet built, and worth knowing before you depend on this: the Go SDK; the three-tier KMS/HSM key hierarchy of §3.5 (today every signer uses a single flat key, so treat signing keys as long-lived secrets); post-quantum suites, which are reserved in the registry but unimplemented; composite signatures; and RFC 3161 timestamp anchoring. The `nego` anti-downgrade binding (§4.1) ships in the Python SDK but not yet in TypeScript.
+**Authority binding (§9.2) is provisional**: the wire shape, and a reference implementation of its stateless half (validity window, effect labeling), landed in v0.1.3/v0.1.4 and are implemented in the Python SDK (`tap_sdk.authority`, `TAPClient.authorize()`/`trace(authorize=...)`). It is not yet in the TypeScript SDK, not enforced by any Verifier (revocation and single-use are stateful and unbuilt), and not in the Gateway or Inspector.
 
-Open an issue if a gap blocks you — the roadmap is driven by what implementers actually hit.
-
-Breaking changes are possible before v1.0. The wire format is versioned (`v: "tap/0.1"`) and negotiated, so upgrades are a gradient rather than a flag day.
-
----
+Known gaps include the unimplemented production key hierarchy, post-quantum suites, composite signatures, timestamp anchoring, a third independently authored language implementation, and — as above — most of authority binding.
 
 ## Contributing
 
-Issues and PRs welcome — see [CONTRIBUTING.md](CONTRIBUTING.md). The one hard rule: **any change to signing or verification must be accompanied by regenerated test vectors and must pass both SDKs' conformance suites.** The vectors are the contract.
+Start with [Project governance](docs/governance.md) and [CONTRIBUTING.md](CONTRIBUTING.md).
 
-For security issues, see [SECURITY.md](SECURITY.md) — please don't open a public issue.
+The hard rule is simple: if a change affects signing or verification, the conformance artifacts must change with it.
 
-## License
+## License and stewardship
 
 Apache-2.0. See [LICENSE](LICENSE).
 
----
-
-*TAP is stewarded by [Sworn](https://getsworn.ai), which operates a hosted Verifier built on this standard. The protocol is deliberately vendor-neutral: the format, the reference implementation, the verification logic, and the conformance vectors are open so that anyone can verify a TAP record without trusting Sworn, the agent operator, or any other party.*
+TAP is stewarded by [Sworn](https://getsworn.ai). The protocol and verification logic remain open so a third party can validate a TAP record without trusting Sworn, the agent operator, or the system that stored the evidence.

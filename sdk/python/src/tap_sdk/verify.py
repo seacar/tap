@@ -1,6 +1,6 @@
 """Verification logic: signatures, drift, sequence integrity, assurance.
 
-This is the Verifier conformance class (TAP-spec §13): §3 signature checks, §4.3
+This is the Verifier conformance class ([TAP-CONFORMANCE]): §3 signature checks, §4.3
 passport validation, §5.4 event verification, §6 assurance labeling, §7 chain
 join + replay signals, §9 code preservation. It is pure(ish) — it takes records
 and a key resolver and returns evaluations — so it is equally usable by the
@@ -15,6 +15,7 @@ from typing import Any, Callable
 from .display import hydrate_record
 
 from .core import (
+    RevokedKey,
     checkpoint_root,
     key_revoked_at,
     scope_satisfied,
@@ -26,6 +27,7 @@ from .policy import (
     evaluate as evaluate_policy,
     policy_version,
 )
+from .authority import authority_effect_label
 
 # kid -> public JWK dict
 KeyResolver = Callable[[str], dict | None]
@@ -53,35 +55,39 @@ def evaluate_event(
     """Evaluate one event. Returns sig validity, drift, and integrity signals.
 
     An invalid signature is itself evidence — it is recorded, never silently
-    dropped (TAP-spec §6.1).
+    dropped ([TAP-EVT-ENVELOPE]).
     """
     kid = event.get("kid")
     jwk = resolve_key(kid) if kid else None
 
     sig_valid = False
+    revoked_key = False
     if jwk is not None:
-        # Revocation check (TAP-spec §3.2): reject events where kid.revoked_at ≤ event.ts.
-        # The ts field is inside the signed body, so an attacker cannot backdate it without
-        # invalidating the signature — making this check safe before full verification.
-        revoked = key_revoked_at(jwk)
-        if revoked is not None:
-            event_ts = _parse_event_ts(event.get("ts"))
-            if event_ts is not None and event_ts >= revoked:
-                return {
-                    "event_id": event.get("event_id"),
-                    "sig_valid": False,
-                    "drift": False,
-                    "drift_reason": "key_revoked",
-                    "integrity": {},
-                    "policy_decision": None,
-                    "denied": False,
-                }
+        # verify_event enforces suite dispatch and the revocation boundary itself
+        # [TAP-EVT-VERIFY]; RevokedKey is separated out here only so the report can
+        # say *why* — "this key was retired" is a different operational story from
+        # "this signature is wrong".
         try:
             sig_valid = verify_event(jwk, event)
+        except RevokedKey:
+            revoked_key = True
         except Exception:
             sig_valid = False
 
-    # Drift: scope_used ⊆ passport.scope (TAP-spec §8). Only meaningful once the
+    if revoked_key:
+        return {
+            "event_id": event.get("event_id"),
+            "sig_valid": False,
+            "drift": False,
+            "drift_reason": "key_revoked",
+            "integrity": {},
+            "policy_decision": None,
+            "denied": False,
+            "authorization": None,
+            "authority_effect": None,
+        }
+
+    # Drift: scope_used ⊆ passport.scope ([TAP-SCOPE-MATCH]). Only meaningful once the
     # signature is valid and we know the governing passport.
     drift = False
     drift_reason = None
@@ -91,7 +97,7 @@ def evaluate_event(
             drift = True
             drift_reason = "scope_escalation"
 
-    # Sequence integrity (TAP-spec §5.3): gaps and duplicates are signals.
+    # Sequence integrity ([TAP-EVT-SEQ]): gaps and duplicates are signals.
     integrity: dict[str, Any] = {}
     seq = event.get("seq")
     if isinstance(seq, int) and last_seq is not None:
@@ -100,9 +106,18 @@ def evaluate_event(
         elif seq > last_seq + 1:
             integrity["seq_gap"] = list(range(last_seq + 1, seq))
 
-    # Policy decision stamped at enforcement time (build spec §9.4). The Verifier
+    # Policy decision stamped at enforcement time [TAP-POLICY-RECORD]. The Verifier
     # records it as-signed; a denial is itself audit evidence.
     pd = event.get("policy_decision") if sig_valid else None
+
+    # Authority binding [TAP-EVT-AUTHORIZATION, §9.2, PROVISIONAL]. Labeled
+    # ALONGSIDE policy_decision and two-sided assurance, never in place of
+    # either — see authority_effect_label's docstring. Revocation and
+    # single-use are NOT checked here: they are stateful and unimplemented in
+    # this reference Verifier (§9.2).
+    authorization = event.get("authorization") if sig_valid else None
+    authority_effect = (authority_effect_label(authorization, event.get("result") or {})
+                        if authorization is not None else None)
 
     return {
         "event_id": event.get("event_id"),
@@ -112,13 +127,15 @@ def evaluate_event(
         "integrity": integrity,
         "policy_decision": pd,
         "denied": bool(pd and pd.get("decision") == "deny"),
+        "authorization": authorization,
+        "authority_effect": authority_effect,
     }
 
 
 def check_passport(
     compact_jwt: str, *, resolve_key: KeyResolver, now: int | None = None
 ) -> dict:
-    """Validate a passport per TAP-spec §4.3. Returns claims + validity flags."""
+    """Validate a passport per [TAP-PASSPORT-VALIDATE]. Returns claims + validity flags."""
     now = now or int(time.time())
     try:
         header_kid = _peek_kid(compact_jwt)
@@ -152,8 +169,71 @@ def peek_kid(compact_jwt: str) -> str | None:
 _peek_kid = peek_kid  # backward-compatible alias
 
 
+def reconcile_checkpoint(checkpoint: dict, events: list[dict]) -> dict:
+    """Reconcile one signed checkpoint against the Events actually delivered
+    [TAP-EVT-CHECKPOINT].
+
+    The interval is half-open and **self-describing**: `(from_seq, through_seq]`,
+    both carried in the signed body. Reading the lower bound from the checkpoint
+    rather than inferring it from whichever earlier checkpoints happened to arrive
+    is what keeps reconciliation correct when one of them was lost or suppressed —
+    inferring it makes every checkpoint after a missing one report a mismatch
+    caused by the verifier's own bookkeeping.
+
+    Two signals, deliberately kept apart:
+
+    * ``root_mismatch`` — the delivered set is not the sealed set. An integrity
+      failure, but on its own it does not say which Event is missing, or whether
+      one was *added*.
+    * ``provably_deleted`` — specific ``event_id``s the Signer committed to and
+      never delivered. This is the strong claim, and it is only available when the
+      checkpoint enumerates its leaves (``reconciliation.event_ids``), which the
+      conformance vectors do and a bare wire checkpoint does not.
+
+    Reporting a mismatch *as* provable deletion overstates the evidence, and
+    overstating evidence is the one thing an audit tool must never do.
+    """
+    cp = checkpoint.get("checkpoint") or {}
+    through_seq = cp.get("through_seq")
+    # from_seq is REQUIRED as of v0.1.2. Absent, the safest reading of a legacy
+    # checkpoint is "from the start of the record", which is what the interval
+    # meant before the bound was explicit.
+    from_seq = cp.get("from_seq", 0) or 0
+    claimed_root = cp.get("event_id_root")
+
+    delivered = [
+        e for e in events
+        if isinstance(e.get("seq"), int)
+        and from_seq < e["seq"] <= (through_seq if isinstance(through_seq, int) else -1)
+    ]
+    delivered_ids = [e.get("event_id", "") for e in sorted(delivered, key=lambda e: e["seq"])]
+    actual_root = checkpoint_root(delivered_ids)
+    root_valid = actual_root == claimed_root
+
+    # Only computable when the committed leaves are known; a wire checkpoint
+    # carries the root alone, by design (the root is the commitment).
+    committed_ids = (checkpoint.get("reconciliation") or {}).get("event_ids")
+    missing = ([eid for eid in committed_ids if eid not in set(delivered_ids)]
+               if isinstance(committed_ids, list) else [])
+
+    count_claimed = cp.get("count")
+    return {
+        "from_seq": from_seq,
+        "through_seq": through_seq,
+        "count_claimed": count_claimed,
+        "count_received": len(delivered_ids),
+        "count_matches": count_claimed is None or count_claimed == len(delivered_ids),
+        "root_valid": root_valid,
+        "root_mismatch": not root_valid,
+        "computed_root": actual_root,
+        "claimed_root": claimed_root,
+        "provably_deleted": missing,
+        "sig_valid": True,
+    }
+
+
 def assurance_level(legs: list[dict]) -> str:
-    """Two-sided attestation labeling per TAP-spec §7 — full consistency predicate.
+    """Two-sided attestation labeling per [TAP-ASSURANCE] — full consistency predicate.
 
     Returns intent-only / two-sided / conflicting. The consistency predicate is
     normative: both legs must agree on cid, action.tool, action.kind, and their
@@ -197,7 +277,7 @@ def assurance_level(legs: list[dict]) -> str:
 def nego_violation(legs: list[dict]) -> bool:
     """True iff any leg's ``evidence.nego`` claims ``attestation:"server"`` while
     this action's own correlated legs contain no ``server`` attestor at all
-    (TAP-spec §4.1 anti-downgrade). A network intermediary that strips the
+    ([TAP-NEGO-BINDING] anti-downgrade). A network intermediary that strips the
     handshake removes the server leg, but the Signer's own signed claim
     survives — this is exactly that scenario, and per §4.1 it MUST be flagged
     identically to a conflicting attestation.
@@ -230,7 +310,7 @@ def _levels_for_groups(groups: dict[str, list[dict]]) -> dict[str, str]:
 
 
 def annotate_assurance(record: dict | None) -> dict | None:
-    """Enrich a reconstructed record with two-sided attestation state (TAP-spec §6).
+    """Enrich a reconstructed record with two-sided attestation state ([TAP-EVT-ENVELOPE]).
 
     Correlates the agent leg (``attestor:"agent"``) and the server leg
     (``attestor:"server"``) of each action on their shared ``action_ref``, stamps
@@ -278,7 +358,7 @@ def annotate_assurance(record: dict | None) -> dict | None:
 
 
 def build_chain(cid: str, records: list[dict]) -> dict:
-    """Stitch a multi-agent delegation chain (build spec §9.3; TAP-spec §7.1).
+    """Stitch a multi-agent delegation chain (spec §8.1).
 
     Real agent systems are trees: orchestrator → specialist → tools. All records in
     one chain share a ``cid``; each ``received_delegation`` event references the
@@ -340,7 +420,7 @@ def verify_transcript(
     resolve_key: KeyResolver,
     now: int | None = None,
 ) -> dict:
-    """Audit-in-a-Box report (TAP-spec §14) — the artifact an auditor wants."""
+    """Audit-in-a-Box report ([TAP-CONFORMANCE]) — the artifact an auditor wants."""
     pp = check_passport(passport_jwt, resolve_key=resolve_key, now=now)
     claims = pp.get("claims")
 
@@ -358,7 +438,7 @@ def verify_transcript(
     duplicates: list[int] = []
     # Sig-valid legs grouped by action_ref — the same shape annotate_assurance()
     # groups, so verify_transcript() can surface identical assurance/nego signals
-    # in the Audit-in-a-Box report (TAP-spec §4.1, §7).
+    # in the Audit-in-a-Box report ([TAP-NEGO-BINDING], §7).
     action_groups: dict[str, list[dict]] = {}
 
     for ev in regular:
@@ -390,40 +470,28 @@ def verify_transcript(
         if isinstance(seq, int):
             last_seq = seq if last_seq is None else max(last_seq, seq)
 
-    # Checkpoint reconciliation (TAP-spec §6.3): verify Merkle roots and detect
-    # provably-deleted events (sig-valid checkpoint + root mismatch → provable gap).
+    # Checkpoint reconciliation [TAP-EVT-CHECKPOINT].
     checkpoint_results: list[dict] = []
     for cp in checkpoints:
         cp_res = evaluate_event(
             cp, resolve_key=resolve_key, passport_claims=claims, last_seq=None
         )
         if cp_res["sig_valid"]:
-            cp_data = cp.get("checkpoint") or {}
-            through_seq = cp_data.get("through_seq")
-            claimed_root = cp_data.get("event_id_root")
-            # Gather event_ids of regular events in this checkpoint's interval
-            interval_ids = [
-                e.get("event_id", "")
-                for e in regular
-                if isinstance(e.get("seq"), int) and e["seq"] <= (through_seq or 0)
-            ]
-            actual_root = checkpoint_root(interval_ids)
-            root_valid = actual_root == claimed_root
-            checkpoint_results.append({
-                "through_seq": through_seq,
-                "count_claimed": cp_data.get("count"),
-                "count_received": len(interval_ids),
-                "root_valid": root_valid,
-                # root_valid=False with sig_valid=True → events were provably deleted
-                "provably_deleted": not root_valid,
-                "sig_valid": True,
-            })
+            checkpoint_results.append(
+                reconcile_checkpoint(cp, regular)
+            )
 
     total = len(regular) + len(checkpoints)
     invalid_sig = len(regular) - valid_sig
-    verified = pp["valid"] and not pp.get("expired") and invalid_sig == 0 and not drift
+    # A record with a sound signature on every event but a checkpoint that does not
+    # reconcile is NOT verified: the checkpoint is the only thing standing between
+    # fail-open reporting and undetectable suppression [TAP-EVT-CHECKPOINT].
+    verified = (
+        pp["valid"] and not pp.get("expired") and invalid_sig == 0 and not drift
+        and all(c["root_valid"] and c["count_matches"] for c in checkpoint_results)
+    )
 
-    # Assurance per action_ref (TAP-spec §7) + nego anti-downgrade folding (§4.1) —
+    # Assurance per action_ref ([TAP-ASSURANCE]) + nego anti-downgrade folding (§4.1) —
     # the same computation annotate_assurance() runs at read time, reused here so
     # the audit report and the live record view never disagree.
     assurance_by_ref = _levels_for_groups(action_groups)
@@ -439,6 +507,15 @@ def verify_transcript(
         parts.append(f"{len(denials)} action(s) denied by policy.")
     if checkpoints:
         parts.append(f"{len(checkpoints)} checkpoint(s) present.")
+    bad_roots = [c for c in checkpoint_results if c["root_mismatch"]]
+    deleted = [eid for c in checkpoint_results for eid in c["provably_deleted"]]
+    if bad_roots:
+        parts.append(
+            f"{len(bad_roots)} checkpoint root mismatch(es) — the delivered events "
+            f"are not the sealed set."
+        )
+    if deleted:
+        parts.append(f"{len(deleted)} event(s) provably deleted: {deleted}.")
     if nego_mismatches:
         parts.append(f"{len(nego_mismatches)} action(s) show conflicting/downgraded assurance.")
     if not pp["valid"]:
@@ -464,7 +541,7 @@ def backtest_policy(
     passport_claims: dict | None = None,
     env: str | None = None,
 ) -> dict:
-    """Re-evaluate a historical transcript against a policy version (build spec §9.4).
+    """Re-evaluate a historical transcript against a policy version [TAP-POLICY-RECORD].
 
     This is two things at once:
 

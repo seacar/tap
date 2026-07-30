@@ -1,5 +1,5 @@
 """Policy engine — policy-as-code, shared by the Shim, the server leg, and the
-Verifier (build spec §9.4; TAP-spec §8 defines only the *record* format).
+Verifier [TAP-POLICY-RECORD].
 
 One policy set, three enforcement points (defense in depth):
   * the Shim    — deny **before acting**     (prevention; the Tenet-uncopyable edge)
@@ -10,7 +10,7 @@ Because all three import *this* module, a decision made at the edge is reproduci
 byte-for-byte at audit time — which is the compliance crux: an auditor can prove
 exactly which rule, in which policy version, governed any historical action.
 
-Design choices (build spec §9.4):
+Design choices:
   * **Constrained JSON rule schema**, not a hand-rolled DSL — predictable, diffable.
   * Hidden behind an **``Evaluator`` interface** so an OPA/Rego or CEL backend can
     slot in later without touching any call site.
@@ -18,9 +18,9 @@ Design choices (build spec §9.4):
     string over its JCS canonicalization), so "we had a policy" becomes "here is
     the signed proof of the policy that ran."
 
-The wire spec keeps the policy *language* out of scope (TAP-spec §14, Service
+The wire spec keeps the policy *language* out of scope ([TAP-CONFORMANCE], Service
 Profiles); this is that Service Profile. What crosses the wire is only the
-``policy_decision`` record (TAP-spec §8): ``{decision, rule_id, policy_version}``.
+``policy_decision`` record [TAP-POLICY-RECORD]: ``{decision, rule_id, policy_version}``.
 """
 from __future__ import annotations
 
@@ -42,7 +42,7 @@ __all__ = [
 ]
 
 # An empty default-allow policy: a real, hashable policy that denies nothing.
-# Useful as a neutral baseline (drift, TAP-spec §8, remains a separate built-in).
+# Useful as a neutral baseline (drift, [TAP-SCOPE-MATCH], remains a separate built-in).
 EMPTY_POLICY: dict = {"default": "allow", "rules": []}
 
 
@@ -56,7 +56,7 @@ def policy_version(policy: dict) -> str:
     Uses the same JCS (RFC 8785) canonicalization as event signing, so the
     version is stable across key reordering / whitespace and reproducible by any
     third party. This is the value stamped into every ``policy_decision`` so an
-    auditor can prove *which* policy governed a historical action (build spec §9.4).
+    auditor can prove *which* policy governed a historical action [TAP-POLICY-RECORD].
     """
     return digest(jcs.canonicalize(policy))
 
@@ -70,7 +70,7 @@ class PolicyRequest:
 
     tool: str | None = None              # action.tool (tool name or target agent id)
     scope_used: str | None = None        # action.scope_used
-    kind: str = "tool_call"              # action.kind (TAP-spec §5.2)
+    kind: str = "tool_call"              # action.kind ([TAP-EVT-ENVELOPE])
     agent_name: str | None = None        # passport.meta.agent_name
     agent_id: str | None = None          # logical agent id
     args: dict[str, Any] | None = None   # args_preview (when captured) for predicates
@@ -97,7 +97,7 @@ class PolicyRequest:
 
 @dataclass(frozen=True)
 class PolicyDecision:
-    """The TAP-spec §8 ``policy_decision`` record, plus the matched rule for UX."""
+    """The [TAP-POLICY-RECORD] ``policy_decision`` record, plus the matched rule for UX."""
 
     decision: str               # "allow" | "deny"
     rule_id: str | None         # the rule that fired (None ⇒ default decision)

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""The `nego` anti-downgrade binding (TAP-spec §4.1).
+"""The `nego` anti-downgrade binding ([TAP-NEGO-BINDING]).
 
 The handshake itself is not signed, so a network intermediary can strip it and
 force a silent downgrade to intent-only. The defence is to bind the negotiated

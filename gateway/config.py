@@ -66,7 +66,7 @@ def load_config() -> GatewayConfig:
         with open(policy_file) as f:
             policy = json.load(f)
 
-    # How often the server-attested leg is batched to the Verifier (TAP-spec §10,
+    # How often the server-attested leg is batched to the Verifier ([TAP-RESULT-CODES],
     # fail-open reporting). Default matches EventReporter's own default; lower it
     # for a snappier caller-visible two-sided result (e.g. a local demo).
     flush_interval_s = float(os.environ.get("GATEWAY_FLUSH_INTERVAL_S", "2.0"))

@@ -1,0 +1,23 @@
+{
+  "_about": "Example JWKS, served in production at https://<issuer>/.well-known/jwks.json [TAP-KEY-REVOCATION]. This file uses the PUBLIC reference key from test-vectors.json and MUST NOT be deployed.",
+  "keys": [
+    {
+      "kty": "OKP",
+      "crv": "Ed25519",
+      "alg": "EdDSA",
+      "use": "sig",
+      "kid": "key_2026_ref01",
+      "x": "11qYAYKxCrfVS_7TyWQHOg7hcvPapiMlrwIaaPcHURo"
+    },
+    {
+      "kty": "OKP",
+      "crv": "Ed25519",
+      "alg": "EdDSA",
+      "use": "sig",
+      "kid": "key_2026_retired01",
+      "x": "11qYAYKxCrfVS_7TyWQHOg7hcvPapiMlrwIaaPcHURo",
+      "revoked_at": 1767225600,
+      "_note": "A revoked key stays PUBLISHED: records signed before revoked_at remain verifiable, and removing the key entirely would destroy evidence rather than invalidate it."
+    }
+  ]
+}

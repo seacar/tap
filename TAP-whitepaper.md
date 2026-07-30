@@ -2,9 +2,11 @@
 
 ### An Open Standard for Cryptographically Verifiable Agent Provenance
 
-**Status:** Whitepaper · Companion to TAP Specification v0.1 · **Version:** 0.1.1 · **Date:** 2026-07-22
+**Status:** Whitepaper · Companion to TAP Specification v0.1 · **Version:** 0.1.4 · **Date:** 2026-08-29
 **License (intended):** Apache-2.0 (specification + reference code)
 **Reference implementation:** `tap_ref.py` · **Conformance contract:** `test-vectors.json`
+
+> **This document is explanatory, not normative.** It exists to explain *why* TAP is shaped the way it is. Every normative rule lives in **`TAP-spec-v0.1.md`**, which governs wherever the two disagree, and in `test-vectors.json`, which governs the signed bytes. Section numbering here is independent of the specification's — cite the specification's stable `[TAP-…]` anchor tags, never a section number from this document.
 
 ---
 
@@ -185,7 +187,7 @@ Like MCP, TAP is a **negotiated** protocol. A Signer and TAP-aware Server agree 
 // Signer → Server (offered)
 "tap_hello": {
   "versions": ["tap/0.1"],
-  "algs": ["EdDSA"],
+  "suites": ["tap-ed25519"],
   "attestation": "requested",
   "kid": "key_2026_ref01"
 }
@@ -193,7 +195,7 @@ Like MCP, TAP is a **negotiated** protocol. A Signer and TAP-aware Server agree 
 // Server → Signer (selected)
 "tap_hello_ack": {
   "version": "tap/0.1",
-  "alg": "EdDSA",
+  "suite": "tap-ed25519",
   "attestation": "server",
   "checkpoints": "supported"
 }
@@ -201,7 +203,9 @@ Like MCP, TAP is a **negotiated** protocol. A Signer and TAP-aware Server agree 
 
 `attestation: "server"` tells the Signer the upstream will emit execution Events (two-sided assurance available); `attestation: "none"` means intent-only. If no mutually supported version exists, the parties fall back to unattested operation.
 
-**Anti-downgrade.** Because the handshake is not signed, a network intermediary could strip it to force silent downgrade. To detect this, the Signer MUST bind the negotiated outcome — selected `version`, suite, and `attestation` level — into the first Event it signs, as a `nego` object under `evidence`. A verifier compares the claimed negotiation against what actually arrived; a missing server leg when `attestation:"server"` was recorded is flagged identically to a `conflicting` attestation.
+**Anti-downgrade.** Because the handshake is not signed, a network intermediary could strip it to force silent downgrade. To detect this, the Signer binds the negotiated outcome — selected `version`, `suite`, and `attestation` level — into the first Event it signs, as a `nego` object under `evidence`. A verifier compares the claimed negotiation against what actually arrived; a missing server leg when `attestation:"server"` was recorded is flagged identically to a `conflicting` attestation.
+
+The value bound must be the outcome the Signer *observed*, not an expectation an operator configured. Binding a configured expectation would make the check compare a claim against itself, which detects nothing — see `[TAP-NEGO-BINDING]`.
 
 ### 4.2 Adoption as a Gradient
 
@@ -324,15 +328,18 @@ A bare sequence gap is ambiguous: tampering (an Event was deleted) or benign los
 
 ```jsonc
 "checkpoint": {
+  "from_seq": 0,                // exclusive lower bound — the interval is self-describing
   "through_seq": 42,
-  "event_id_root": "sha256:…",  // Merkle root over event_ids in (prev_checkpoint, 42]
+  "event_id_root": "sha256:…",  // Merkle root over event_ids in (from_seq, 42]
   "count": 42
 }
 ```
 
 A verifier reconciles delivered Events against the latest checkpoint: an `event_id` in the Merkle commitment but never delivered is **provable deletion**, not benign loss. This turns "a gap is suspicious" into "a gap is provably malicious or provably benign," making fail-open reporting safe for integrity.
 
-**Merkle construction (normative).** Leaves: `SHA-256(0x00 ‖ utf8(event_id))`; interior nodes: `SHA-256(0x01 ‖ left ‖ right)`. Odd-count levels promote the final node unchanged. A root mismatch is an integrity failure MUST be surfaced, not silently ignored.
+**Merkle construction.** Leaves are `SHA-256(0x00 ‖ utf8(event_id))`, interior nodes `SHA-256(0x01 ‖ left ‖ right)`, and an odd-count level promotes the final node unchanged. A root mismatch is an integrity failure and must be surfaced, not silently ignored.
+
+The complete, normative construction — including the ordering rule, the self-describing `(from_seq, through_seq]` interval, the empty-interval root, and the distinction between a root mismatch and a *provable deletion* — is `[TAP-EVT-CHECKPOINT]` in the specification. It is stated there and only there, so that the two documents cannot drift into two subtly different Merkle trees.
 
 ### 6.4 Decision Events — The Counterfactual Ledger
 
@@ -381,7 +388,9 @@ Two legs are *consistent* when they agree on `cid`, `action.tool`, and `action.k
 
 ---
 
-## 9. Policy Decisions and Drift
+## 9. Policy Decisions, Drift, and Authority Binding
+
+### 9.1 Policy Decisions and Drift
 
 TAP standardizes the **record** of a policy decision, not the policy language. An enforcement point attaches:
 
@@ -404,6 +413,26 @@ TAP standardizes the **record** of a policy decision, not the policy language. A
 | `UPSTREAM_4XX` | upstream rejected the request |
 | `UPSTREAM_5XX` | upstream failed to process the request |
 | `VALIDATION_ERROR` | request or arguments were malformed |
+| `DENIED_AUTHORITY_EXPIRED` | authority-binding validity window elapsed — provisional, §9.2 |
+| `DENIED_AUTHORITY_REVOKED` | authority-binding approval or authority state was revoked — provisional, §9.2 |
+| `DENIED_AUTHORITY_REUSED` | a single-use approval was presented twice — provisional, §9.2 |
+
+### 9.2 Authority Binding — From *Permitted* to *Landed as Approved*
+
+> **Provisional.** This subsection describes a wire extension specified normatively in `TAP-spec-v0.1.md` §9.2. As of v0.1.4, `tap_ref.py` signs/verifies it and implements its two stateless checks (validity window, effect labeling), with a fixed vector in `test-vectors.json → authorization`. Revocation and single-use enforcement are stateful and remain unbuilt everywhere, and no production Signer, Verifier, or SDK implements any of this yet — treat it as the documented direction of travel, not a deployable capability.
+
+Drift (§9.1) and `policy_decision` answer a narrow but important question: *was this class of action permitted under the rules in force?* They do not answer a related, harder question: *did this specific action's actual effect match what was actually approved for it?* Those are different claims. A Signer can hold a validly-scoped Passport, a policy engine can correctly allow the action under every rule in force, the resulting Event can be perfectly signed and — where a server leg exists — independently attested — and the action can still not be the one anyone approved for that instance. Two-sided attestation (§7) proves an independent party witnessed the execution; it does not by itself prove the execution's effect was the effect someone specifically signed off on.
+
+Authority binding closes that gap by letting an Event carry a pre-declared, signed expectation of its own outcome, bound to a specific version of the authority that granted it and valid only for a bounded window:
+
+- **`target_state_digest`** — a digest of the expected resulting state, declared *before* the action runs.
+- **`authority_state_version`** — which version of the governing policy/permission set this approval was granted under, using the same digest construction as `policy_version` (§9.1) but scoped to one approval rather than the whole active policy.
+- **`nbf`/`exp`** — a validity window, so a stale-but-validly-signed approval cannot be replayed against a since-changed authority state.
+- **`authz_id`** — a single-use identifier; presenting it twice is a replay indicator, exactly like Passport `jti` reuse.
+
+After the action runs, `result.effect_digest` records what actually happened, computed the same way `target_state_digest` was declared. Comparing the two yields a new label — `authorized_match` / `authorized_mismatch` / `unverified_authority` — reported *alongside* the existing two-sided/conflicting assurance labels, not in place of them. This is the precise distinction worth holding onto: **provenance proves an action is authentic; authority binding proves it was legitimate.** A record can be simultaneously `two-sided` (an independent party attested the execution happened) and `authorized_mismatch` (what it did wasn't the thing anyone signed off on) — that combination is exactly the failure mode two-sided attestation alone cannot catch, because it only asks *who signed*, never *what was approved*.
+
+`policy_decision` and `authorization` compose rather than compete: an Event may carry either, both, or neither. The full normative shape — the `authorization` object, the validity and revocation rules, and the `[TAP-AUTHORITY-*]` tags — lives in `TAP-spec-v0.1.md` §9.2.
 
 ---
 
@@ -530,6 +559,8 @@ The EU AI Act (Regulation 2024/1689) requires high-risk systems to technically a
 The v0.1 design closes the interoperability and privacy gaps that most often bite implementers: deterministic numbers (§3.4) remove float-canonicalization divergence; the digests-only signed body with redactable annex (§6.1, §11) reconciles tamper-evidence with erasure; and signed checkpoints (§6.3) disambiguate sequence gaps under fail-open reporting.
 
 What remains is execution and ecosystem. Python and Node Shims already ship and both reproduce `test-vectors.json` byte-for-byte; a **Go Shim** is the next language to prove the conformance contract holds across runtimes. The reference Verifier already enforces revocation (`revoked_at`) and checkpoint Merkle reconciliation, but does **not yet** check the `nego` anti-downgrade binding (§4.1) against actual assurance achieved — that is a near-term correctness gap in the reference implementation, not a spec change. Beyond that: roll the **key hierarchy** (§3.5) to production KMS/HSM with environment attestation — today every Shim signs with a single flat key, with no ephemeral-key minting or attestation certificate yet implemented; stand up the **post-quantum path** (§3.6) — register `tap-ml-dsa-65`/`tap-slh-dsa-128s`, implement composite signatures, begin timestamp-anchoring checkpoint roots to an RFC 3161 authority (none of this has code yet); publish the **Gateway** and **Inspector** (neither exists in any form today — the Gateway in particular is the highest-leverage unshipped piece, since it is what lets a deployer reach two-sided assurance without waiting on upstream tool vendors); define the **policy-language Service Profile**; and align with **prEN ISO/IEC 24970**, **FIPS 204/205**, and the broader MCP/A2A security efforts.
+
+**Authority binding (§9.2) is the next planned capability slice**, specified (provisional) in v0.1.3 and given a reference implementation for its stateless half in v0.1.4: `tap_ref.py` now signs/verifies the `authorization` object and `result.effect_digest` and implements the validity-window check and the match/mismatch/unverified effect labels, all covered by a fixed vector. Implementing it moves TAP from proving an action is *authentic* to also proving it stayed within what was *actually approved for that instance* — closing the one gap two-sided attestation (§7) cannot see on its own: an independently-witnessed, fully authentic action whose effect nonetheless wasn't the one anyone signed off on. What remains is the stateful half and the ecosystem around it — none of it exists yet: the reference Verifier's revocation resource for `authz_id`/`authority_state_version` (`[TAP-AUTHORITY-REVOKE]`), single-use enforcement (`[TAP-AUTHORITY-REUSE]`), Shim ergonomics for minting/consuming an approval, and SDK parity in Python and Node. The revocation resource in particular is likely to be high-leverage relative to its cost, since it reuses the effective-time-boundary mechanism the Verifier already implements for key revocation (§3.2).
 
 The deepest open question remains inherent and acknowledged: TAP proves authorship and integrity, not honesty. It cannot establish that an agent's stated reasoning is its *real* reasoning, or that a compromised Signer is not signing fluent lies. The answer is structural — independent server attestation, model-output-bound counterfactuals, signed checkpoints, and a record any skeptical third party can check without trusting anyone.
 

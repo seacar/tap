@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Production entrypoint for the TAP Gateway.
 
-    GATEWAY_UPSTREAM_URL=https://legacy-tool.internal python distribution/gateway/serve.py
+    GATEWAY_UPSTREAM_URL=https://legacy-tool.internal python gateway/serve.py
 
 See ``gateway.config`` for the
 full list of environment variables.

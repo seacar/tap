@@ -1,4 +1,4 @@
-"""TAP-aware Gateway (whitepaper §4.4, §15) — a drop-in reverse proxy that brings
+"""TAP-aware Gateway (spec §4.3) — a drop-in reverse proxy that brings
 two-sided attestation to upstream tools that have never heard of TAP.
 
 Where an upstream tool is not TAP-aware, the Gateway sits in front of it: it

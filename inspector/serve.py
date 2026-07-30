@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Local entrypoint for the TAP Inspector web UI.
 
-    python distribution/inspector/serve.py
+    python inspector/serve.py
 
 Binds 127.0.0.1 only by default (unlike the Verifier's production 0.0.0.0
 convention) — this tool mints and signs test keys and shouldn't be reachable
@@ -11,7 +11,7 @@ import os
 import sys
 from pathlib import Path
 
-# distribution/ -> makes the `inspector` package importable for uvicorn's
+#  -> makes the `inspector` package importable for uvicorn's
 # string-based "inspector.app:app" load; inspector/app.py's own header adds
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 

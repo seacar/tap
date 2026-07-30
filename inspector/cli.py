@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """TAP Inspector CLI — local dev tool to mint test Passports, sign/verify Events,
-and visualize a record's chain (whitepaper §15). No new crypto or verification
+and visualize a record's chain ([TAP-SUITE-DISPATCH]). No new crypto or verification
 logic: every command is a thin wrapper over `inspector.core`, which itself only
 calls `tap_sdk`.
 
@@ -9,7 +9,7 @@ itself draws the line between TAP-the-protocol and TAPClient-the-product, and a
 third party building their own Signer against just tap/+shared+shim+verifier
 shouldn't need control-plane dependencies to use the Inspector.
 
-Usage (run from the distribution/ directory, or with it on PYTHONPATH):
+Usage (run from the  directory, or with it on PYTHONPATH):
     python -m inspector.cli generate-key
     python -m inspector.cli mint-passport --private-key-hex ... --kid ... \\
         --prompt "Resolve ticket #123" --scope read:database
@@ -27,7 +27,7 @@ import json
 import sys
 from pathlib import Path
 
-# distribution/ -> makes the `inspector` package importable (for `python
+#  -> makes the `inspector` package importable (for `python
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import httpx
