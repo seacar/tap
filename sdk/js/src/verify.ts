@@ -11,14 +11,30 @@
 // evaluations, so it serves an ingest hot path and an offline audit report alike.
 
 import {
+  PassportExpired,
   RevokedKey,
   b64uToBytes,
   checkpointRoot,
+  parseTs,
   scopeSatisfied,
   verifyEvent,
   verifyPassport,
   type Jwk,
 } from "./tap.js";
+import { AuthorityRevoked, authorityEffectLabel, checkAuthorityNotRevoked } from "./authority.js";
+
+/**
+ * (authzId, authorityStateVersion) -> revoked_at (epoch seconds), or
+ * null/undefined when neither is known to be revoked [TAP-AUTHORITY-REVOKE,
+ * §9.2, provisional]. This SDK ships no default resolver/registry —
+ * publication format and query interface are a Service Profile concern (spec
+ * §9.2, §15); a caller (Sworn, or a self-hoster) supplies one. Mirrors
+ * VerifyKeyResolver's shape deliberately.
+ */
+export type AuthorityRevocationResolver = (
+  authzId: string,
+  authorityStateVersion: string,
+) => number | null | undefined | Promise<number | null | undefined>;
 
 /**
  * kid -> public JWK, or null when the key is unknown.
@@ -28,6 +44,16 @@ import {
  * the network, which the server-side resolver never has to do.
  */
 export type VerifyKeyResolver = (kid: string) => Jwk | null | Promise<Jwk | null>;
+
+/**
+ * kid -> true iff this key is one the deployment recognizes as belonging to a
+ * TAP-aware Server or Gateway, and therefore permitted to sign a leg claiming
+ * `attestor: "server"` [TAP-ASSURANCE-KEY]. There is no protocol-level way to
+ * derive this: "independent attestation" is a trust relationship a Verifier holds
+ * out of band, exactly as it holds the JWKS it resolves keys against. Omitted, the
+ * structural floor in `assuranceLevel` still applies.
+ */
+export type ServerKeyPredicate = (kid: string) => boolean;
 
 export type Assurance = "intent-only" | "two-sided" | "conflicting";
 
@@ -39,6 +65,13 @@ export interface EventEvaluation {
   integrity: { seq_gap?: number[]; seq_duplicate?: number };
   policy_decision: Record<string, unknown> | null;
   denied: boolean;
+  /** [TAP-EVT-AUTHORIZATION, §9.2, provisional] — the Event's authorization block, as signed. */
+  authorization: Record<string, unknown> | null;
+  /** [TAP-AUTHORITY-EFFECT, §9.2, provisional] — null when no `authorization` is present. */
+  authority_effect: ReturnType<typeof authorityEffectLabel>;
+  /** [TAP-AUTHORITY-REVOKE, §9.2, provisional] — always false unless a
+   * `resolveAuthorityRevocation` was supplied and flagged this record. */
+  authority_revoked: boolean;
 }
 
 type Ev = Record<string, any>;
@@ -55,6 +88,10 @@ export async function evaluateEvent(
     resolveKey: VerifyKeyResolver;
     passportClaims?: Record<string, any> | null;
     lastSeq?: number | null;
+    /** [TAP-AUTHORITY-REVOKE, §9.2, provisional] — optional; see
+     * {@link AuthorityRevocationResolver}. Omitted, `authority_revoked` stays
+     * false — this function ships no default registry. */
+    resolveAuthorityRevocation?: AuthorityRevocationResolver;
   },
 ): Promise<EventEvaluation> {
   const kid = event.kid as string | undefined;
@@ -83,6 +120,9 @@ export async function evaluateEvent(
       integrity: {},
       policy_decision: null,
       denied: false,
+      authorization: null,
+      authority_effect: null,
+      authority_revoked: false,
     };
   }
 
@@ -112,6 +152,39 @@ export async function evaluateEvent(
   }
 
   const pd = sigValid ? ((event.policy_decision as Record<string, unknown>) ?? null) : null;
+  // [TAP-EVT-AUTHORIZATION / TAP-AUTHORITY-EFFECT, §9.2, provisional]. Labeled
+  // ALONGSIDE policy_decision and two-sided assurance, never in place of
+  // either. Only meaningful once the signature checks out — an unverified
+  // leg's claimed authorization is not evidence. Single-use is NOT checked
+  // here: batch-local reuse is verifyTranscript's job (it needs the whole
+  // batch); cross-session reuse needs a live registry this pure function
+  // does not have.
+  const authorization = sigValid ? ((event.authorization as Record<string, unknown>) ?? null) : null;
+  const authorityEffect = authorization ? authorityEffectLabel(authorization as any, event.result) : null;
+
+  // Revocation [TAP-AUTHORITY-REVOKE, §9.2, provisional]: kept separate from
+  // authority_effect on purpose — a revoked-but-matching Event is a worse
+  // signal than a mismatch, not a non-signal — and it does NOT flip
+  // sig_valid: the signature is still authentic, only the claimed authority
+  // is void, the same distinction this codebase already draws between "wrong
+  // signature" and "denied by policy".
+  let authorityRevoked = false;
+  if (authorization && opts.resolveAuthorityRevocation) {
+    const signedTs = typeof event.ts === "string" ? parseTs(event.ts) : NaN;
+    if (Number.isFinite(signedTs)) {
+      const revokedAt = await opts.resolveAuthorityRevocation(
+        authorization.authz_id as string, authorization.authority_state_version as string);
+      try {
+        checkAuthorityNotRevoked(
+          authorization.authz_id as string, authorization.authority_state_version as string,
+          revokedAt, signedTs);
+      } catch (e) {
+        if (e instanceof AuthorityRevoked) authorityRevoked = true;
+        else throw e;
+      }
+    }
+  }
+
   return {
     event_id: event.event_id,
     sig_valid: sigValid,
@@ -120,6 +193,9 @@ export async function evaluateEvent(
     integrity,
     policy_decision: pd,
     denied: Boolean(pd && pd.decision === "deny"),
+    authorization,
+    authority_effect: authorityEffect,
+    authority_revoked: authorityRevoked,
   };
 }
 
@@ -156,7 +232,8 @@ export async function checkPassport(
     return { valid: true, expired: false, claims: claims as Record<string, any> };
   } catch (e) {
     const reason = (e as Error).message;
-    return { valid: false, expired: reason.includes("expired"), reason, claims: null };
+    // A typed error, not a substring match on a message [TAP-PASSPORT-VALIDATE].
+    return { valid: false, expired: e instanceof PassportExpired, reason, claims: null };
   }
 }
 
@@ -243,10 +320,24 @@ export function reconcileCheckpoint(checkpoint: Ev, events: Ev[]): CheckpointRec
  * consistency predicate: both legs must agree on `cid`, `action.tool` and
  * `action.kind`, and their results must not contradict.
  */
-export function assuranceLevel(legs: Ev[]): Assurance {
+export function assuranceLevel(legs: Ev[], isServerKey?: ServerKeyPredicate): Assurance {
   const agent = legs.filter((e) => e.attestor === "agent");
   const server = legs.filter((e) => e.attestor === "server");
   if (server.length === 0) return "intent-only";
+
+  // Key independence, before any content comparison [TAP-ASSURANCE-KEY].
+  // `attestor` is a self-declared string inside a signed body, so a Signer can
+  // simply write "server" on a leg it signed itself. Taking it at face value
+  // would let any agent mint `two-sided` with one key — the exact property §7
+  // claims cannot be forged. Without `isServerKey` we apply the structural
+  // floor (a server leg may not share an agent leg's kid); with it, a server
+  // leg must be signed by a key the deployment recognizes as a server's.
+  const agentKids = new Set(agent.map((a) => a.kid));
+  for (const s of server) {
+    const sKid = s.kid as string | undefined;
+    if (!sKid || agentKids.has(sKid)) return "conflicting";
+    if (isServerKey && !isServerKey(sKid)) return "conflicting";
+  }
 
   for (const a of agent) {
     for (const s of server) {
@@ -290,10 +381,13 @@ export function negoViolation(legs: Ev[]): boolean {
   return !legs.some((leg) => leg.attestor === "server");
 }
 
-function levelsForGroups(groups: Map<string, Ev[]>): Map<string, Assurance> {
+function levelsForGroups(
+  groups: Map<string, Ev[]>,
+  isServerKey?: ServerKeyPredicate,
+): Map<string, Assurance> {
   const levels = new Map<string, Assurance>();
   for (const [ref, legs] of groups) {
-    let level = assuranceLevel(legs);
+    let level = assuranceLevel(legs, isServerKey);
     // The spec requires a broken nego binding to be flagged identically to legs
     // that disagree, so it folds into the same bucket rather than a softer one.
     if (level !== "conflicting" && negoViolation(legs)) level = "conflicting";
@@ -315,7 +409,10 @@ export interface AnnotatedRecord {
  * shared `action_ref`, stamps every event with its assurance, and raises a
  * record-level `flags.conflicting` when any action's legs disagree.
  */
-export function annotateAssurance(record: AnnotatedRecord | null): AnnotatedRecord | null {
+export function annotateAssurance(
+  record: AnnotatedRecord | null,
+  isServerKey?: ServerKeyPredicate,
+): AnnotatedRecord | null {
   if (!record) return null;
   const records = record.events ?? [];
 
@@ -332,7 +429,7 @@ export function annotateAssurance(record: AnnotatedRecord | null): AnnotatedReco
     }
   }
 
-  const levels = levelsForGroups(groups);
+  const levels = levelsForGroups(groups, isServerKey);
   let conflicting = false;
   let negoMismatchAny = false;
 
@@ -371,10 +468,14 @@ export interface ChainEdge {
  * `verified` only when BOTH legs' signatures check out, so a broken or unverified
  * handoff breaks the chain visibly rather than being silently bridged.
  */
-export function buildChain(cid: string, records: (AnnotatedRecord | null)[]) {
+export function buildChain(
+  cid: string,
+  records: (AnnotatedRecord | null)[],
+  isServerKey?: ServerKeyPredicate,
+) {
   const annotated = records
     .filter((r): r is AnnotatedRecord => r !== null)
-    .map((r) => annotateAssurance(r)!) ;
+    .map((r) => annotateAssurance(r, isServerKey)!) ;
 
   const owner = new Map<string, string>();
   const valid = new Map<string, boolean>();
@@ -427,7 +528,14 @@ export function buildChain(cid: string, records: (AnnotatedRecord | null)[]) {
 export async function verifyTranscript(
   passportJwt: string,
   events: Ev[],
-  opts: { resolveKey: VerifyKeyResolver; now?: number },
+  opts: {
+    resolveKey: VerifyKeyResolver;
+    now?: number;
+    /** [TAP-AUTHORITY-REVOKE, §9.2, provisional] — optional; see {@link evaluateEvent}. */
+    resolveAuthorityRevocation?: AuthorityRevocationResolver;
+    /** [TAP-ASSURANCE-KEY] — optional; see {@link assuranceLevel}. */
+    isServerKey?: ServerKeyPredicate;
+  },
 ) {
   const pp = await checkPassport(passportJwt, opts);
   const claims = pp.claims;
@@ -443,12 +551,19 @@ export async function verifyTranscript(
   const duplicates: number[] = [];
   const actionGroups = new Map<string, Ev[]>();
   let lastSeq: number | null = null;
+  // [TAP-AUTHORITY-REVOKE / TAP-AUTHORITY-REUSE, §9.2, provisional].
+  const authorityRevoked: Record<string, unknown>[] = [];
+  const authorityReuse: Record<string, unknown>[] = [];
+  // authzId -> the first sig-valid event_id it was seen on, for the
+  // batch-local reuse scan below.
+  const seenAuthz = new Map<string, string>();
 
   for (const ev of regular) {
     const res = await evaluateEvent(ev, {
       resolveKey: opts.resolveKey,
       passportClaims: claims,
       lastSeq,
+      resolveAuthorityRevocation: opts.resolveAuthorityRevocation,
     });
     if (res.sig_valid) {
       validSig += 1;
@@ -457,6 +572,27 @@ export async function verifyTranscript(
         const list = actionGroups.get(ref) ?? [];
         list.push(ev);
         actionGroups.set(ref, list);
+      }
+      // Batch-local single-use scan [TAP-AUTHORITY-REUSE]: a duplicate
+      // authz_id across two DIFFERENT sig-valid events in this batch — only
+      // meaningful once the signature checks out, same discipline as every
+      // other authority-binding signal here.
+      const authBlock = res.authorization;
+      const authzId =
+        authBlock && typeof authBlock === "object" && !Array.isArray(authBlock)
+          ? (authBlock as Record<string, unknown>).authz_id
+          : undefined;
+      if (typeof authzId === "string" && authzId) {
+        const firstEventId = seenAuthz.get(authzId);
+        if (firstEventId !== undefined && firstEventId !== res.event_id) {
+          authorityReuse.push({
+            authz_id: authzId,
+            first_event_id: firstEventId,
+            reused_event_id: res.event_id,
+          });
+        } else {
+          seenAuthz.set(authzId, res.event_id as string);
+        }
       }
     }
     if (res.drift) {
@@ -472,6 +608,9 @@ export async function verifyTranscript(
         rule_id: res.policy_decision?.rule_id,
         policy_version: res.policy_decision?.policy_version,
       });
+    }
+    if (res.authority_revoked) {
+      authorityRevoked.push({ event_id: res.event_id, authz_id: res.authorization?.authz_id });
     }
     if (res.integrity.seq_gap) seqGaps.push(...res.integrity.seq_gap);
     if (res.integrity.seq_duplicate !== undefined) duplicates.push(res.integrity.seq_duplicate);
@@ -489,7 +628,7 @@ export async function verifyTranscript(
   }
 
   const invalidSig = regular.length - validSig;
-  const assuranceByRef = levelsForGroups(actionGroups);
+  const assuranceByRef = levelsForGroups(actionGroups, opts.isServerKey);
   const negoMismatches = [...actionGroups.entries()]
     .filter(([, legs]) => negoViolation(legs))
     .map(([ref]) => ref);
@@ -497,12 +636,17 @@ export async function verifyTranscript(
   // A record whose every signature is sound but whose checkpoint does not
   // reconcile is NOT verified: the checkpoint is the only thing standing between
   // fail-open reporting and undetectable suppression [TAP-EVT-CHECKPOINT].
+  // A `conflicting` action is an integrity alert, not a footnote: legs that
+  // disagree, or a "server" leg signed by a key that cannot be an independent
+  // attestation [TAP-ASSURANCE-KEY]. Reporting `verified: true` over one would
+  // assert exactly the property that failed.
   const verified =
     pp.valid &&
     !pp.expired &&
     invalidSig === 0 &&
     drift.length === 0 &&
-    checkpointResults.every((c) => c.root_valid && c.count_matches);
+    checkpointResults.every((c) => c.root_valid && c.count_matches) &&
+    [...assuranceByRef.values()].every((level) => level !== "conflicting");
 
   const parts: string[] = [];
   parts.push(invalidSig === 0 ? "All signatures valid." : `${invalidSig} invalid signature(s).`);
@@ -521,6 +665,24 @@ export async function verifyTranscript(
   if (negoMismatches.length) {
     parts.push(`${negoMismatches.length} action(s) show conflicting/downgraded assurance.`);
   }
+  const conflictingRefs = [...assuranceByRef.entries()]
+    .filter(([, level]) => level === "conflicting")
+    .map(([ref]) => ref);
+  if (conflictingRefs.length) {
+    parts.push(
+      `${conflictingRefs.length} action(s) labeled conflicting — legs disagree, or a ` +
+        `'server' leg was not independently attested [TAP-ASSURANCE-KEY].`,
+    );
+  }
+  if (duplicates.length) {
+    parts.push(`${duplicates.length} duplicate (aid, seq) slot(s) at ${duplicates}.`);
+  }
+  if (authorityRevoked.length) {
+    parts.push(`${authorityRevoked.length} event(s) named a revoked authority binding.`);
+  }
+  if (authorityReuse.length) {
+    parts.push(`${authorityReuse.length} authz_id reuse(s) detected.`);
+  }
   if (!pp.valid) parts.push(`Passport invalid (${pp.reason}).`);
 
   return {
@@ -531,6 +693,8 @@ export async function verifyTranscript(
     checkpoints: checkpointResults,
     drift,
     denials,
+    authority_revoked: authorityRevoked,
+    authority_reuse: authorityReuse,
     assurance: {
       by_action_ref: Object.fromEntries(assuranceByRef),
       nego_mismatches: negoMismatches,

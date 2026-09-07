@@ -61,6 +61,11 @@ class EventReporter:
         self._passport_jwt: str | None = None
         self._stop = threading.Event()
         self.dropped = 0  # overflow counter (surfaced for diagnostics)
+        # Batches the Verifier did not accept. Fail-open means the agent keeps
+        # running, not that nobody can tell delivery failed — checkpoints
+        # (§6.3) are what make undelivered events detectable downstream, and
+        # this is what makes them visible locally.
+        self.failed_sends = 0
         self._worker = threading.Thread(target=self._run, name="tap-reporter", daemon=True)
         self._worker.start()
 
@@ -102,6 +107,7 @@ class EventReporter:
         except Exception:
             # Re-queue (best effort) and try again next tick. Fail-open: the
             # agent keeps running regardless of Verifier availability.
+            self.failed_sends += 1
             for pair in batch:
                 self.submit(*pair)
 
@@ -112,15 +118,41 @@ class EventReporter:
             if batch:
                 self._send(batch)
 
-    def flush(self) -> None:
-        """Synchronously drain everything currently queued (used at shutdown
-        and in tests)."""
-        while True:
-            batch = self._drain(self._batch_size)
+    def flush(self, *, timeout_s: float | None = 5.0) -> None:
+        """Attempt one delivery pass over everything currently queued.
+
+        Bounded on purpose. The obvious loop — drain, send, repeat until empty —
+        never terminates when the Verifier is unreachable, because ``_send``
+        re-queues the batch it failed to deliver and the next drain hands the
+        same items straight back. That turns a down Verifier into a hot spin at
+        shutdown, which is exactly what §11.3's "a Signer MUST NOT block
+        execution on reporting availability" forbids.
+
+        So this makes at most one pass over the items present when it was
+        called: undelivered events stay queued for the background worker (or the
+        next flush), ``failed_sends`` records that delivery did not happen, and
+        the caller gets control back. ``timeout_s`` bounds it in wall-clock terms
+        too, for a Verifier that accepts connections but answers slowly; pass
+        ``None`` to bound by queue contents alone.
+        """
+        deadline = None if timeout_s is None else time.monotonic() + timeout_s
+        # Snapshot the backlog size first: anything `_send` re-queues below lands
+        # behind this bound rather than inside it.
+        remaining = self._q.qsize()
+        while remaining > 0:
+            if deadline is not None and time.monotonic() >= deadline:
+                return
+            batch = self._drain(min(self._batch_size, remaining))
             if not batch:
                 return
+            remaining -= len(batch)
             self._send(batch)
 
-    def close(self) -> None:
-        self.flush()
+    def close(self, *, timeout_s: float | None = 5.0) -> None:
+        """Stop the worker after one bounded delivery attempt.
+
+        The worker is stopped even when delivery failed: a shutdown path that
+        waits for an unreachable Verifier is a hang, not durability.
+        """
+        self.flush(timeout_s=timeout_s)
         self._stop.set()

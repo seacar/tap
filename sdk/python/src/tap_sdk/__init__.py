@@ -12,6 +12,10 @@ wrong. See TAP-spec-v0.1.md.
 """
 from .core import (
     SPEC_VERSION,
+    InvalidRecord,
+    PassportExpired,
+    RevokedKey,
+    UnknownSuite,
     b64u,
     b64u_dec,
     digest,
@@ -34,9 +38,11 @@ from .authority import (
     Authorization,
     AuthorityError,
     AuthorityExpired,
+    AuthorityRevoked,
     authority_effect_label,
     authority_state_version,
     check_authority_window,
+    check_authority_not_revoked,
 )
 from .agent_id import resolve_agent_id
 from .signer import DelegationRejected, Passport, PolicyDenied, TAPClient
@@ -80,10 +86,14 @@ __all__ = [
     "resolve_agent_id",
     "sign_event", "verify_event", "sign_passport", "verify_passport",
     "public_jwk", "load_signer", "digest", "b64u", "b64u_dec", "SPEC_VERSION",
+    # Verification failures, raised (never asserted) so `python -O` cannot
+    # strip them [TAP-PASSPORT-VALIDATE], [TAP-EVT-VERIFY].
+    "InvalidRecord", "PassportExpired", "RevokedKey", "UnknownSuite",
     # policy-as-code [TAP-POLICY-RECORD]
     "PolicyDenied", "PolicyDecision", "PolicyRequest", "PolicyError",
     "evaluate_policy", "policy_version", "EMPTY_POLICY",
     # authority binding [TAP-EVT-AUTHORIZATION, §9.2, provisional]
-    "Authorization", "AuthorityError", "AuthorityExpired",
-    "authority_state_version", "check_authority_window", "authority_effect_label",
+    "Authorization", "AuthorityError", "AuthorityExpired", "AuthorityRevoked",
+    "authority_state_version", "check_authority_window", "check_authority_not_revoked",
+    "authority_effect_label",
 ]

@@ -62,6 +62,14 @@ jobs:
       - name: Policy engine
         working-directory: sdk/python
         run: PYTHONPATH=src python3 tests/test_policy.py
+      # These two ran in scripts/ci-local.sh but had never been added here, so
+      # the newest feature's tests (§9.2 authority binding) ran on no CI machine.
+      - name: Authority binding (§9.2)
+        working-directory: sdk/python
+        run: PYTHONPATH=src python3 tests/test_authority.py
+      - name: Regressions (defects that shipped once)
+        working-directory: sdk/python
+        run: PYTHONPATH=src python3 tests/test_regressions.py
       - name: Instance suffix
         working-directory: sdk/python
         run: PYTHONPATH=src python3 tests/test_instance_suffix.py
@@ -88,6 +96,26 @@ jobs:
       - name: Type check / build
         working-directory: sdk/js
         run: npm run build
+
+  go-sdk:
+    name: Go SDK
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.22"
+      # The Go SDK shipped in README.md's repository map and in the project-status
+      # paragraph's "three SDKs cross-checked against one reference
+      # implementation", while appearing in no CI job and no line of
+      # scripts/ci-local.sh. Anyone could change signed bytes and this SDK would
+      # have kept compiling against the old shape until someone ran it by hand.
+      - name: Vet
+        working-directory: sdk/go
+        run: go vet ./...
+      - name: Conformance vectors, negatives, and authority binding
+        working-directory: sdk/go
+        run: go test ./...
 
   services:
     name: Gateway and Inspector
@@ -143,6 +171,18 @@ jobs:
         run: |
           (cd sdk/js && npx tsx test/envelopeParity.test.ts)
           (cd sdk/python && PYTHONPATH=src python3 tests/test_envelope_parity.py)
+      # ...and the check that actually DIFFS them, across every event kind. The
+      # step above asserts a rule about one SDK's output for one kind, which is
+      # why three real divergences (result.latency_ms null-vs-omitted, two
+      # different `tool` values for record_output, and an unregistered
+      # action.kind) lived in main while it passed. This also validates both
+      # SDKs' composed events against schemas/event.schema.json — nothing ever
+      # had, because check-schemas.py validates the vectors, which are generated
+      # by tap_ref.py rather than by either SDK.
+      - name: Both SDKs emit the same envelope shapes, and both match the schema
+        run: |
+          pip install --quiet jsonschema
+          python3 scripts/check-envelope-parity.py
       - name: A JS-signed record verifies in Python
         run: |
           (cd sdk/js && npx tsx test/interop.ts > /tmp/js_event.json)
@@ -173,13 +213,24 @@ jobs:
           python3 -m venv /tmp/clean
           /tmp/clean/bin/pip install --quiet ./sdk/python
           /tmp/clean/bin/python -c "from tap_sdk import TAPClient; import tap_sdk.verify; print('ok - traceable-agent-protocol imports')"
+      # The README's own two commands, verbatim — no `npm run build` first.
+      # That extra build is exactly why this job never caught the quickstart
+      # being broken: `dist/` is gitignored and the build hook was
+      # `prepublishOnly`, which `npm install <folder>` does not run, so a reader
+      # following the README got ERR_MODULE_NOT_FOUND while CI stayed green.
+      - name: The README's TypeScript quickstart, as written
+        run: |
+          npm --prefix sdk/js install
+          mkdir -p /tmp/npmclean && cd /tmp/npmclean && npm init -y >/dev/null
+          npm install --silent "$GITHUB_WORKSPACE/sdk/js"
+          node --input-type=module -e "import('@traceableagent/sdk/agent').then(m => { if (!m.TAPClient) throw new Error('TAPClient missing'); console.log('ok - @traceableagent/sdk imports'); })"
       - name: npm pack the tarball and import it
         run: |
-          cd sdk/js && npm install && npm run build
+          cd sdk/js
           TARBALL=$(npm pack --silent)
-          mkdir -p /tmp/npmclean && cd /tmp/npmclean && npm init -y >/dev/null
-          npm install --silent "$OLDPWD/$TARBALL"
-          node --input-type=module -e "import('@traceableagent/sdk/agent').then(m => { if (!m.TAPClient) throw new Error('TAPClient missing'); console.log('ok - @traceableagent/sdk imports'); })"
+          mkdir -p /tmp/npmtar && cd /tmp/npmtar && npm init -y >/dev/null
+          npm install --silent "$GITHUB_WORKSPACE/sdk/js/$TARBALL"
+          node --input-type=module -e "import('@traceableagent/sdk/agent').then(m => { if (!m.TAPClient) throw new Error('TAPClient missing'); console.log('ok - tarball imports'); })"
 
   secrets:
     name: Secret scan

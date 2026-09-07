@@ -1,7 +1,7 @@
 # Integration guide
 
 **Audience:** platform engineers and service owners  
-**Status:** explanatory guide for TAP v0.1.2
+**Status:** explanatory guide for TAP v0.1.5
 
 TAP can be added at three boundaries: inside an agent runtime, at a server that understands TAP, or at a Gateway in front of an unchanged upstream.
 
@@ -9,7 +9,7 @@ TAP can be added at three boundaries: inside an agent runtime, at a server that 
 
 Instrument the narrowest reusable client boundary that sees the action before it leaves the process. That is usually:
 
-- an MCP client wrapper;
+- an MCP client wrapper (`TAPClient.instrument_mcp` in Python, `instrumentMcp` in TypeScript — both wrap a `call_tool`/`callTool`-shaped client with no MCP SDK dependency and no key custody beyond the caller's own client; TAP does not ship an MCP server — see [Architecture](architecture.md));
 - an A2A delegation client;
 - a shared tool dispatcher;
 - a framework middleware hook;

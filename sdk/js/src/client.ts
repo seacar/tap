@@ -15,6 +15,7 @@ import {
   textDigest,
 } from "./tap.js";
 import {
+  authorizationHeaders,
   helloHeaders,
   offer,
   readAck,
@@ -22,6 +23,21 @@ import {
   type Hello,
   type Negotiated,
 } from "./negotiate.js";
+import {
+  Authorization,
+  AuthorityExpired,
+  checkAuthorityWindow,
+  type AuthorizationRecord,
+} from "./authority.js";
+
+const DEFAULT_AUTHORIZATION_TTL_S = 3600;
+
+/**
+ * The extension kind `recordOutput` emits [TAP-EVT-KIND]. Namespaced because
+ * §6.2's taxonomy is closed apart from the `x-` prefix, and identical to the
+ * Python SDK's `MODEL_RESPONSE_KIND` so the two compose identical envelopes.
+ */
+export const MODEL_RESPONSE_KIND = "x-model-response";
 
 export interface TapCarriage {
   passport: string;
@@ -37,18 +53,24 @@ export interface TapCarriage {
 export function passportHttpHeaders(
   passport: Passport,
   actionRef?: string,
-  opts?: { hello?: Hello },
+  opts?: { hello?: Hello; authorization?: AuthorizationRecord },
 ): Record<string, string> {
   const headers: Record<string, string> = { "X-Agent-Passport": passport.compact };
   if (actionRef) headers["X-TAP-Action-Ref"] = actionRef;
   if (opts?.hello) Object.assign(headers, helloHeaders(opts.hello));
+  if (opts?.authorization) Object.assign(headers, authorizationHeaders(opts.authorization));
   return headers;
 }
 
 /** Passport carriage for JSON-RPC `_meta` transport (spec §11.2). */
-export function passportMeta(passport: Passport, actionRef?: string): Record<string, unknown> {
+export function passportMeta(
+  passport: Passport,
+  actionRef?: string,
+  opts?: { authorization?: AuthorizationRecord },
+): Record<string, unknown> {
   const tap: Record<string, unknown> = { passport: passport.compact };
   if (actionRef) tap.action_ref = actionRef;
+  if (opts?.authorization) tap.authorization = opts.authorization;
   return { tap };
 }
 function nowTs(): string {
@@ -167,6 +189,10 @@ export class TAPClient {
     extraAnnex?: Record<string, unknown>;
     parentEventId?: string;
     policyDecision?: Record<string, unknown>;
+    /** [TAP-EVT-AUTHORIZATION, §9.2, provisional] — bind this Event to a pre-declared approval. */
+    authorization?: AuthorizationRecord;
+    /** [TAP-AUTHORITY-EFFECT, §9.2, provisional] — digest of the actual resulting state. */
+    effectDigest?: string;
   }): Promise<Record<string, unknown>> {
     const p = args.passport ?? this.requirePassport();
     const eventId = newId("evt");
@@ -224,6 +250,11 @@ export class TAPClient {
     if (args.latencyMs !== undefined && args.latencyMs !== null) {
       result.latency_ms = args.latencyMs;
     }
+    if (args.effectDigest !== undefined) {
+      // [TAP-AUTHORITY-EFFECT, §9.2, provisional] — omit when unmeasured, never
+      // null, matching every other optional field's omit discipline.
+      result.effect_digest = args.effectDigest;
+    }
 
     // Absent optional fields are OMITTED, never emitted as explicit nulls
     // [TAP-EVT-OMIT]. `null` and absent are different signed bytes, so a TS signer
@@ -247,6 +278,7 @@ export class TAPClient {
     if (Object.keys(evidence).length > 0) body.evidence = evidence;
     if (args.parentEventId) body.parent_event_id = args.parentEventId;
     if (args.policyDecision) body.policy_decision = args.policyDecision;
+    if (args.authorization) body.authorization = args.authorization; // [TAP-EVT-AUTHORIZATION, §9.2, provisional]
     if (args.decision) body.decision = args.decision;
     const event = await signEvent(this.opts.privateKeyHex, body);
     this.eventIds.push(eventId);
@@ -254,6 +286,38 @@ export class TAPClient {
     const hasAnnexContent = Object.keys(annex).length > 1;
     this.buffer.push({ event, annex: hasAnnexContent ? annex : null });
     return event;
+  }
+
+  // --- authority binding [TAP-EVT-AUTHORIZATION, §9.2, PROVISIONAL] ---------
+  // Stateless half only: minting an approval and checking its validity window.
+  // Revocation and single-use enforcement are stateful and live on the
+  // Verifier, not here — see ./authority.ts's module docstring.
+
+  /**
+   * Mint a bound approval for an action not yet taken.
+   *
+   * `targetState` is the expected resulting state (digested here, never
+   * signed in the raw); `authorityState` is the policy/permission state this
+   * approval was granted under (digested the same way `authority_state_version`
+   * digests a policy set). Pass the returned {@link Authorization} to
+   * {@link traceTool}'s `authorize` option.
+   */
+  authorize(args: {
+    targetState: unknown;
+    authorityState: unknown;
+    ttlS?: number;
+    issuerKid?: string;
+    authzId?: string;
+  }): Authorization {
+    const now = Math.floor(Date.now() / 1000);
+    return Authorization.grant({
+      targetState: args.targetState,
+      authorityState: args.authorityState,
+      nbf: now,
+      exp: now + (args.ttlS ?? DEFAULT_AUTHORIZATION_TTL_S),
+      issuerKid: args.issuerKid ?? this.opts.kid,
+      authzId: args.authzId,
+    });
   }
 
   // --- handshake [TAP-NEGOTIATE] ---------------------------------------------
@@ -329,15 +393,61 @@ export class TAPClient {
     return event;
   }
 
-  /** Wrap an async tool call: sign a tool_call event around it (intent-only). */
+  /**
+   * Wrap an async tool call: sign a tool_call event around it (intent-only).
+   *
+   * `authorize` binds this call to a pre-declared expected effect
+   * [TAP-EVT-AUTHORIZATION, §9.2, provisional]: its validity window is
+   * checked *before* `fn` runs — an expired approval blocks the call and a
+   * signed `denied` event with `DENIED_AUTHORITY_EXPIRED` is emitted instead,
+   * exactly like a policy denial. If `effectOf` is given, the digest of
+   * `effectOf(fn's return value)` is compared against the approval's declared
+   * `target_state_digest` and recorded as `result.effect_digest`. Omit
+   * `effectOf` to still bind and validate the approval without asserting a
+   * specific effect (the Event is then labeled `unverified_authority`
+   * downstream).
+   */
   async traceTool<T>(
-    spec: { tool: string; scope: string; intent?: string; args?: unknown },
+    spec: {
+      tool: string;
+      scope: string;
+      intent?: string;
+      args?: unknown;
+      authorize?: Authorization;
+      effectOf?: (result: T) => unknown;
+    },
     fn: () => Promise<T>,
   ): Promise<T> {
+    // Enforcement point: deny *before acting* [TAP-AUTHORITY-VALIDITY].
+    // Revocation/reuse are NOT checked here — they are stateful and belong to
+    // the Verifier (§9.2, provisional).
+    if (spec.authorize) {
+      try {
+        checkAuthorityWindow(spec.authorize, Math.floor(Date.now() / 1000));
+      } catch (e) {
+        if (e instanceof AuthorityExpired) {
+          await this.emit({
+            kind: "denied",
+            intent: spec.intent ?? `Call ${spec.tool}`,
+            tool: spec.tool,
+            scopeUsed: spec.scope,
+            argsValue: spec.args ?? {},
+            status: "denied",
+            code: "DENIED_AUTHORITY_EXPIRED",
+            authorization: spec.authorize.toRecord(),
+          });
+        }
+        throw e;
+      }
+    }
+
     const t0 = Date.now();
     let status = "success", code = "OK", error: string | null = null;
+    let effectDigest: string | undefined;
     try {
-      return await fn();
+      const ret = await fn();
+      if (spec.authorize && spec.effectOf) effectDigest = jsonDigest(spec.effectOf(ret));
+      return ret;
     } catch (e) {
       status = "failure"; code = "TOOL_ERROR"; error = (e as Error).message;
       throw e;
@@ -350,6 +460,8 @@ export class TAPClient {
         argsValue: spec.args ?? {},
         status, code, error,
         latencyMs: Date.now() - t0,
+        authorization: spec.authorize?.toRecord(),
+        effectDigest,
       });
     }
   }
@@ -405,7 +517,8 @@ export class TAPClient {
     }
   }
 
-  /** Sign an agent tool_call leg with an explicit outcome (for integrity demos). */
+  /** Sign an agent tool_call leg with an explicit outcome (for integrity demos
+   * and instrumentation seams like {@link instrumentMcp}). */
   async signToolCall(args: {
     tool: string;
     scope: string;
@@ -416,6 +529,7 @@ export class TAPClient {
     error?: string | null;
     actionRef?: string;
     passport?: Passport;
+    latencyMs?: number;
   }): Promise<Record<string, unknown>> {
     return this.emit({
       kind: "tool_call",
@@ -428,6 +542,7 @@ export class TAPClient {
       error: args.error ?? null,
       passport: args.passport,
       actionRef: args.actionRef,
+      latencyMs: args.latencyMs,
     });
   }
 
@@ -442,7 +557,10 @@ export class TAPClient {
     const text =
       typeof args.output === "string" ? args.output : JSON.stringify(args.output);
     return this.emit({
-      kind: "model_response",
+      // Not one of the seven registered kinds (§6.2), so it MUST be a
+      // namespaced extension [TAP-EVT-KIND]. Shared verbatim with the Python
+      // SDK's `MODEL_RESPONSE_KIND` so the two compose identical envelopes.
+      kind: MODEL_RESPONSE_KIND,
       intent: args.intent ?? "Agent response",
       tool: "agent.record",
       scopeUsed: args.scopeUsed ?? null,

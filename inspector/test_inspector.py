@@ -92,6 +92,61 @@ def test_verify_agrees_with_the_sdk_on_a_local_record() -> None:
     assert report["events"]["invalid_sig"] == 0, report
 
 
+def test_authority_binding_is_surfaced_read_only() -> None:
+    """[TAP-EVT-AUTHORIZATION / TAP-AUTHORITY-EFFECT, §9.2, provisional]: the
+    Inspector displays the bound approval and its effect label — display only,
+    no enforcement (revocation/reuse are surfaced by tap_sdk.verify, not
+    independently checked here — see the next test)."""
+    vectors = json.loads((REPO / "test-vectors.json").read_text(encoding="utf-8"))
+    av = vectors["authorization"]
+    resolve_key = {k["kid"]: k for k in vectors["jwks"]["keys"]}.get
+
+    record = core.build_record_from_local(
+        passport_claims=None, events=[av["signed_event"]], resolve_key=resolve_key,
+    )
+    ev = record["events"][0]
+    assert ev["sig_valid"], record
+    assert ev["authorization"]["authz_id"] == av["signed_event"]["authorization"]["authz_id"]
+    assert ev["authority_effect"] == "authorized_match"
+
+    from tap_sdk import verify as V
+    rendered = core.render_chain_ascii(V.annotate_assurance(record))
+    assert av["signed_event"]["authorization"]["authz_id"] in rendered
+    assert "authority_effect=authorized_match" in rendered
+
+
+def test_authority_revocation_is_surfaced_via_a_supplied_resolver() -> None:
+    """[TAP-AUTHORITY-REVOKE, §9.2, provisional]: `make_revocation_resolver`
+    loads a local {id: revoked_at} map (a debugging convenience, not a
+    registry this tool operates) and `build_record_from_local` wires it in."""
+    vectors = json.loads((REPO / "test-vectors.json").read_text(encoding="utf-8"))
+    av = vectors["authorization"]
+    authz_id = av["signed_event"]["authorization"]["authz_id"]
+    resolve_key = {k["kid"]: k for k in vectors["jwks"]["keys"]}.get
+
+    # No resolver: not flagged.
+    record = core.build_record_from_local(
+        passport_claims=None, events=[av["signed_event"]], resolve_key=resolve_key,
+    )
+    assert record["events"][0]["authority_revoked"] is False
+
+    # A resolver revoking this authz_id in the deep past (well before the
+    # vector's own signed `ts`): flagged, and rendered.
+    revoke_source = json.dumps({authz_id: 1})
+    resolve_authority_revocation = core.make_revocation_resolver(revoke_source)
+    record = core.build_record_from_local(
+        passport_claims=None, events=[av["signed_event"]], resolve_key=resolve_key,
+        resolve_authority_revocation=resolve_authority_revocation,
+    )
+    ev = record["events"][0]
+    assert ev["sig_valid"], record
+    assert ev["authority_revoked"] is True
+
+    from tap_sdk import verify as V
+    rendered = core.render_chain_ascii(V.annotate_assurance(record))
+    assert "REVOKED" in rendered
+
+
 def main() -> None:
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     print(f"1..{len(tests)}")

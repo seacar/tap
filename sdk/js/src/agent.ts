@@ -3,7 +3,9 @@
  * Issue passports, sign tool events, record decisions, call TAP-aware tools.
  */
 export * from "./tap.js";
+export * from "./authority.js";
 export * from "./client.js";
+export * from "./instrumentMcp.js";
 export * from "./negotiate.js";
 export * from "./verify.js";
 export * from "./api.js";

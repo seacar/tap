@@ -98,3 +98,11 @@ TAP is complementary to:
 - security incident and case-management systems.
 
 Those systems can consume TAP evidence, but TAP does not replace them.
+
+### TAP does not ship an MCP server
+
+TAP's MCP support is a thin, client-side seam: `instrument_mcp`/`instrumentMcp` wrap an existing MCP client's `call_tool` to sign a `tool_call` Event around it, using the caller's own key. There is no `@modelcontextprotocol/sdk` dependency anywhere in this repository, and no plan to add one.
+
+A hosted MCP server exposing TAP operations as callable tools — mint a credential, check authority, revoke an approval — is a **managed-service concern, not a protocol one**, for the same reason retention, reporting, and tenant administration are (see [the README](../README.md#start-here)). Concretely: a server that signs on a caller's behalf must custody that caller's key, which is exactly the centralization TAP exists to avoid — "a third party can validate a TAP record without trusting Sworn, the agent operator, or the system that stored the evidence" only holds if signing keys never leave the signer. Revocation and authority-state currency (`[TAP-AUTHORITY-REVOKE]`, `[TAP-AUTHORITY-REUSE]`) are stateful for the same reason `[TAP-KEY-REVOCATION]` is — they need a registry someone runs, which is a Verifier/Service-Profile deployment, not a protocol primitive.
+
+If a hosted MCP surface gets built, it belongs to Sworn (or any self-hoster), built on the open `verify`/`authority` primitives this repository already ships — not maintained here.

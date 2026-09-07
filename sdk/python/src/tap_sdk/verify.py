@@ -15,6 +15,7 @@ from typing import Any, Callable
 from .display import hydrate_record
 
 from .core import (
+    PassportExpired,
     RevokedKey,
     checkpoint_root,
     key_revoked_at,
@@ -27,10 +28,25 @@ from .policy import (
     evaluate as evaluate_policy,
     policy_version,
 )
-from .authority import authority_effect_label
+from .authority import AuthorityRevoked, authority_effect_label, check_authority_not_revoked
 
 # kid -> public JWK dict
 KeyResolver = Callable[[str], dict | None]
+
+# kid -> True iff this key is one the deployment recognizes as belonging to a
+# TAP-aware Server or Gateway, and therefore permitted to sign a leg claiming
+# ``attestor: "server"`` [TAP-ASSURANCE-KEY]. There is no protocol-level way to
+# derive this: "independent attestation" is a trust relationship a Verifier holds
+# out of band, exactly as it holds the JWKS it resolves keys against. Omitted, the
+# structural floor in `assurance_level` still applies.
+ServerKeyPredicate = Callable[[str], bool]
+
+# (authz_id, authority_state_version) -> revoked_at (epoch seconds), or None
+# when neither is known to be revoked [TAP-AUTHORITY-REVOKE, §9.2, provisional].
+# This repo ships no default resolver/registry — publication format and query
+# interface are a Service Profile concern (spec §9.2, §15); a caller (Sworn, or
+# a self-hoster) supplies one. Mirrors KeyResolver's shape deliberately.
+AuthorityRevocationResolver = Callable[[str, str], "int | None"]
 
 
 def _parse_event_ts(ts: str | None) -> int | None:
@@ -51,11 +67,18 @@ def evaluate_event(
     resolve_key: KeyResolver,
     passport_claims: dict | None,
     last_seq: int | None,
+    resolve_authority_revocation: AuthorityRevocationResolver | None = None,
 ) -> dict:
     """Evaluate one event. Returns sig validity, drift, and integrity signals.
 
     An invalid signature is itself evidence — it is recorded, never silently
     dropped ([TAP-EVT-ENVELOPE]).
+
+    ``resolve_authority_revocation`` is optional [TAP-AUTHORITY-REVOKE, §9.2,
+    provisional]: when supplied, a sig-valid Event carrying ``authorization``
+    is checked against it. Omitted, the revocation signal simply stays
+    ``False`` — this function ships no default registry (see
+    :data:`AuthorityRevocationResolver`'s docstring).
     """
     kid = event.get("kid")
     jwk = resolve_key(kid) if kid else None
@@ -85,6 +108,7 @@ def evaluate_event(
             "denied": False,
             "authorization": None,
             "authority_effect": None,
+            "authority_revoked": False,
         }
 
     # Drift: scope_used ⊆ passport.scope ([TAP-SCOPE-MATCH]). Only meaningful once the
@@ -112,12 +136,32 @@ def evaluate_event(
 
     # Authority binding [TAP-EVT-AUTHORIZATION, §9.2, PROVISIONAL]. Labeled
     # ALONGSIDE policy_decision and two-sided assurance, never in place of
-    # either — see authority_effect_label's docstring. Revocation and
-    # single-use are NOT checked here: they are stateful and unimplemented in
-    # this reference Verifier (§9.2).
+    # either — see authority_effect_label's docstring. Single-use is NOT
+    # checked here: batch-local reuse is `verify_transcript`'s job (it needs
+    # the whole batch, not one event at a time); cross-session reuse needs a
+    # live registry this pure function does not have.
     authorization = event.get("authorization") if sig_valid else None
     authority_effect = (authority_effect_label(authorization, event.get("result") or {})
                         if authorization is not None else None)
+
+    # Revocation [TAP-AUTHORITY-REVOKE, §9.2, provisional]: kept separate from
+    # authority_effect on purpose — a revoked-but-matching Event is a worse
+    # signal than a mismatch, not a non-signal — and it does NOT flip
+    # sig_valid: the signature is still authentic, only the claimed authority
+    # is void, the same distinction this codebase already draws between "wrong
+    # signature" and "denied by policy".
+    authority_revoked = False
+    if (isinstance(authorization, dict) and resolve_authority_revocation is not None):
+        signed_ts = _parse_event_ts(event.get("ts"))
+        if signed_ts is not None:
+            revoked_at = resolve_authority_revocation(
+                authorization.get("authz_id"), authorization.get("authority_state_version"))
+            try:
+                check_authority_not_revoked(
+                    authorization.get("authz_id"), authorization.get("authority_state_version"),
+                    revoked_at, signed_ts=signed_ts)
+            except AuthorityRevoked:
+                authority_revoked = True
 
     return {
         "event_id": event.get("event_id"),
@@ -129,6 +173,7 @@ def evaluate_event(
         "denied": bool(pd and pd.get("decision") == "deny"),
         "authorization": authorization,
         "authority_effect": authority_effect,
+        "authority_revoked": authority_revoked,
     }
 
 
@@ -144,9 +189,11 @@ def check_passport(
             return {"valid": False, "expired": False, "reason": "unknown kid", "claims": None}
         claims = verify_passport(jwk, compact_jwt, now=now)
         return {"valid": True, "expired": False, "claims": claims}
-    except AssertionError as exc:
-        expired = "expired" in str(exc)
-        return {"valid": False, "expired": expired, "reason": str(exc), "claims": None}
+    except PassportExpired as exc:
+        # A typed exception, not a substring match on an error message: "expired"
+        # is a distinct operational outcome (renew and retry, §4.2) and deciding
+        # it by string search breaks the moment anyone rewords the message.
+        return {"valid": False, "expired": True, "reason": str(exc), "claims": None}
     except Exception as exc:
         return {"valid": False, "expired": False, "reason": str(exc), "claims": None}
 
@@ -232,17 +279,45 @@ def reconcile_checkpoint(checkpoint: dict, events: list[dict]) -> dict:
     }
 
 
-def assurance_level(legs: list[dict]) -> str:
+def assurance_level(legs: list[dict], *, is_server_key: ServerKeyPredicate | None = None) -> str:
     """Two-sided attestation labeling per [TAP-ASSURANCE] — full consistency predicate.
 
     Returns intent-only / two-sided / conflicting. The consistency predicate is
     normative: both legs must agree on cid, action.tool, action.kind, and their
     results must not contradict. A status or code contradiction raises conflicting.
+
+    **Key independence** [TAP-ASSURANCE-KEY]. ``attestor`` is a self-declared
+    string inside a signed body, so a Signer can simply write ``"server"`` on a
+    leg it signed itself. Reading it at face value would let any agent mint
+    ``two-sided`` with one key, which is the whole property §7 claims cannot be
+    forged. Two defences, in order of strength:
+
+    * Without ``is_server_key``, a ``server`` leg sharing an agent leg's ``kid``
+      is rejected as ``conflicting``. This is structural and always applied, but
+      it is only a floor: an agent holding two keys still satisfies it.
+    * With ``is_server_key`` — a predicate the deployment supplies, naming the
+      keys it recognizes as belonging to a TAP-aware Server or Gateway — a
+      ``server`` leg signed by any other key is ``conflicting``. This is the
+      real check: "independently attested" means attested by a key the Verifier
+      independently associates with a server identity, not merely a different
+      one. Deployments SHOULD supply it; the structural floor exists so that
+      omitting it still fails closed against the single-key forgery.
     """
     agent = [e for e in legs if e.get("attestor") == "agent"]
     server = [e for e in legs if e.get("attestor") == "server"]
     if not server:
         return "intent-only"
+
+    # Key independence, before any content comparison: a leg that cannot be an
+    # independent attestation is not evidence of one, however consistent its
+    # contents look [TAP-ASSURANCE-KEY].
+    agent_kids = {a.get("kid") for a in agent}
+    for s in server:
+        s_kid = s.get("kid")
+        if s_kid is None or s_kid in agent_kids:
+            return "conflicting"
+        if is_server_key is not None and not is_server_key(s_kid):
+            return "conflicting"
 
     for a in agent:
         for s in server:
@@ -295,21 +370,23 @@ def nego_violation(legs: list[dict]) -> bool:
     return not any(leg.get("attestor") == "server" for leg in legs)
 
 
-def _levels_for_groups(groups: dict[str, list[dict]]) -> dict[str, str]:
+def _levels_for_groups(groups: dict[str, list[dict]],
+                       is_server_key: ServerKeyPredicate | None = None) -> dict[str, str]:
     """Per-action_ref assurance level for pre-grouped legs, folding the nego
     anti-downgrade check into the same "conflicting" bucket the spec requires.
     Shared by `annotate_assurance` (read-time record view) and
     `verify_transcript` (Audit-in-a-Box report) so the two can't diverge."""
     levels: dict[str, str] = {}
     for ref, legs in groups.items():
-        level = assurance_level(legs)
+        level = assurance_level(legs, is_server_key=is_server_key)
         if level != "conflicting" and nego_violation(legs):
             level = "conflicting"
         levels[ref] = level
     return levels
 
 
-def annotate_assurance(record: dict | None) -> dict | None:
+def annotate_assurance(record: dict | None,
+                       *, is_server_key: ServerKeyPredicate | None = None) -> dict | None:
     """Enrich a reconstructed record with two-sided attestation state ([TAP-EVT-ENVELOPE]).
 
     Correlates the agent leg (``attestor:"agent"``) and the server leg
@@ -331,7 +408,7 @@ def annotate_assurance(record: dict | None) -> dict | None:
         if ref and rec.get("sig_valid"):
             groups.setdefault(ref, []).append(raw)
 
-    levels = _levels_for_groups(groups)
+    levels = _levels_for_groups(groups, is_server_key)
 
     conflicting = False
     nego_mismatch_any = False
@@ -357,7 +434,8 @@ def annotate_assurance(record: dict | None) -> dict | None:
     return hydrate_record(record)
 
 
-def build_chain(cid: str, records: list[dict]) -> dict:
+def build_chain(cid: str, records: list[dict],
+                *, is_server_key: ServerKeyPredicate | None = None) -> dict:
     """Stitch a multi-agent delegation chain (spec §8.1).
 
     Real agent systems are trees: orchestrator → specialist → tools. All records in
@@ -368,7 +446,8 @@ def build_chain(cid: str, records: list[dict]) -> dict:
     or unverified handoff breaks the chain visibly rather than silently. This
     cross-protocol (A2A + MCP) chain of custody is the wedge a single-LLM-call
     model can't hold as systems go multi-agent."""
-    records = [annotate_assurance(r) for r in records if r is not None]
+    records = [annotate_assurance(r, is_server_key=is_server_key)
+               for r in records if r is not None]
 
     # Index every event_id -> its owning aid, and capture each event's validity.
     owner: dict[str, str] = {}
@@ -419,8 +498,16 @@ def verify_transcript(
     *,
     resolve_key: KeyResolver,
     now: int | None = None,
+    resolve_authority_revocation: AuthorityRevocationResolver | None = None,
+    is_server_key: ServerKeyPredicate | None = None,
 ) -> dict:
-    """Audit-in-a-Box report ([TAP-CONFORMANCE]) — the artifact an auditor wants."""
+    """Audit-in-a-Box report ([TAP-CONFORMANCE]) — the artifact an auditor wants.
+
+    ``resolve_authority_revocation`` is optional [TAP-AUTHORITY-REVOKE, §9.2,
+    provisional]; see :func:`evaluate_event`. Reuse of an ``authz_id``
+    [TAP-AUTHORITY-REUSE] is always checked, batch-locally: this needs no
+    registry, only the events actually delivered in this report.
+    """
     pp = check_passport(passport_jwt, resolve_key=resolve_key, now=now)
     claims = pp.get("claims")
 
@@ -436,6 +523,11 @@ def verify_transcript(
     last_seq: int | None = None
     seq_gaps: list[int] = []
     duplicates: list[int] = []
+    authority_revoked: list[dict] = []
+    authority_reuse: list[dict] = []
+    # authz_id -> the first sig-valid event_id it was seen on, for the
+    # batch-local reuse scan below [TAP-AUTHORITY-REUSE, §9.2, provisional].
+    seen_authz: dict[str, str] = {}
     # Sig-valid legs grouped by action_ref — the same shape annotate_assurance()
     # groups, so verify_transcript() can surface identical assurance/nego signals
     # in the Audit-in-a-Box report ([TAP-NEGO-BINDING], §7).
@@ -443,13 +535,30 @@ def verify_transcript(
 
     for ev in regular:
         res = evaluate_event(
-            ev, resolve_key=resolve_key, passport_claims=claims, last_seq=last_seq
+            ev, resolve_key=resolve_key, passport_claims=claims, last_seq=last_seq,
+            resolve_authority_revocation=resolve_authority_revocation,
         )
         if res["sig_valid"]:
             valid_sig += 1
             ref = ev.get("action_ref")
             if ref:
                 action_groups.setdefault(ref, []).append(ev)
+            # Batch-local single-use scan [TAP-AUTHORITY-REUSE]: a duplicate
+            # authz_id across two DIFFERENT sig-valid events in this batch —
+            # only meaningful once the signature checks out, same discipline
+            # as every other authority-binding signal here.
+            auth_block = res["authorization"]
+            authz_id = auth_block.get("authz_id") if isinstance(auth_block, dict) else None
+            if isinstance(authz_id, str) and authz_id:
+                first_event_id = seen_authz.get(authz_id)
+                if first_event_id is not None and first_event_id != res["event_id"]:
+                    authority_reuse.append({
+                        "authz_id": authz_id,
+                        "first_event_id": first_event_id,
+                        "reused_event_id": res["event_id"],
+                    })
+                else:
+                    seen_authz[authz_id] = res["event_id"]
         if res["drift"]:
             drift.append({
                 "event_id": res["event_id"],
@@ -462,6 +571,12 @@ def verify_transcript(
                 "event_id": res["event_id"],
                 "rule_id": pd.get("rule_id"),
                 "policy_version": pd.get("policy_version"),
+            })
+        if res["authority_revoked"]:
+            auth_block = res["authorization"]
+            authority_revoked.append({
+                "event_id": res["event_id"],
+                "authz_id": auth_block.get("authz_id") if isinstance(auth_block, dict) else None,
             })
         seq_gaps.extend(res["integrity"].get("seq_gap", []))
         if "seq_duplicate" in res["integrity"]:
@@ -486,16 +601,21 @@ def verify_transcript(
     # A record with a sound signature on every event but a checkpoint that does not
     # reconcile is NOT verified: the checkpoint is the only thing standing between
     # fail-open reporting and undetectable suppression [TAP-EVT-CHECKPOINT].
-    verified = (
-        pp["valid"] and not pp.get("expired") and invalid_sig == 0 and not drift
-        and all(c["root_valid"] and c["count_matches"] for c in checkpoint_results)
-    )
-
     # Assurance per action_ref ([TAP-ASSURANCE]) + nego anti-downgrade folding (§4.1) —
     # the same computation annotate_assurance() runs at read time, reused here so
     # the audit report and the live record view never disagree.
-    assurance_by_ref = _levels_for_groups(action_groups)
+    assurance_by_ref = _levels_for_groups(action_groups, is_server_key)
     nego_mismatches = [ref for ref, legs in action_groups.items() if nego_violation(legs)]
+
+    # A `conflicting` action is an integrity alert, not a footnote: legs that
+    # disagree, or a "server" leg signed by a key that cannot be an independent
+    # attestation [TAP-ASSURANCE-KEY]. A report that says `verified: true` over
+    # one would be asserting exactly the property that failed.
+    verified = (
+        pp["valid"] and not pp.get("expired") and invalid_sig == 0 and not drift
+        and all(c["root_valid"] and c["count_matches"] for c in checkpoint_results)
+        and all(level != "conflicting" for level in assurance_by_ref.values())
+    )
 
     parts = []
     parts.append("All signatures valid." if invalid_sig == 0 else f"{invalid_sig} invalid signature(s).")
@@ -518,6 +638,17 @@ def verify_transcript(
         parts.append(f"{len(deleted)} event(s) provably deleted: {deleted}.")
     if nego_mismatches:
         parts.append(f"{len(nego_mismatches)} action(s) show conflicting/downgraded assurance.")
+    conflicting_refs = [ref for ref, lvl in assurance_by_ref.items() if lvl == "conflicting"]
+    if conflicting_refs:
+        parts.append(
+            f"{len(conflicting_refs)} action(s) labeled conflicting — legs disagree, or a "
+            f"'server' leg was not independently attested [TAP-ASSURANCE-KEY].")
+    if duplicates:
+        parts.append(f"{len(duplicates)} duplicate (aid, seq) slot(s) at {duplicates}.")
+    if authority_revoked:
+        parts.append(f"{len(authority_revoked)} event(s) named a revoked authority binding.")
+    if authority_reuse:
+        parts.append(f"{len(authority_reuse)} authz_id reuse(s) detected.")
     if not pp["valid"]:
         parts.append(f"Passport invalid ({pp.get('reason')}).")
 
@@ -530,6 +661,9 @@ def verify_transcript(
         "drift": drift,
         "denials": denials,
         "assurance": {"by_action_ref": assurance_by_ref, "nego_mismatches": nego_mismatches},
+        # [TAP-AUTHORITY-REVOKE / TAP-AUTHORITY-REUSE, §9.2, provisional].
+        "authority_revoked": authority_revoked,
+        "authority_reuse": authority_reuse,
         "summary": " ".join(parts),
     }
 

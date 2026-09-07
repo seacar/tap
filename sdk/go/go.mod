@@ -1,4 +1,4 @@
-module github.com/traceable-agent/tap-sdk-go/v2
+module github.com/traceable-agent-protocol/tap/sdk/go
 
 go 1.22
 

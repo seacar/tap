@@ -29,11 +29,14 @@ import httpx  # noqa: E402
 from fastapi.testclient import TestClient  # noqa: E402
 
 from gateway.app import create_app  # noqa: E402
-from tap_sdk import TAPClient  # noqa: E402
+from tap_sdk import Authorization, TAPClient  # noqa: E402
 from tap_sdk.core import load_signer, public_jwk  # noqa: E402
 from tap_sdk.negotiate import ACK_HEADER, HELLO_HEADER, to_header  # noqa: E402
 from tap_sdk.server import TAPServer  # noqa: E402
 from tap_sdk.verify import assurance_level  # noqa: E402
+
+AUTHORITY_STATE = {"policy": "refund-v3", "rules": ["max_refund_cents:10000"]}
+TARGET_STATE = {"ticket": "8842", "status": "refunded", "refund_cents": 5000}
 
 AGENT_SEED = "11" * 32
 AGENT_KID = "key_agent_gw_test"
@@ -183,6 +186,76 @@ def test_agent_and_gateway_legs_reach_two_sided() -> None:
     legs = [e for e in agent_events + server_events if e.get("action_ref") == action_ref]
     assert len(legs) == 2, f"expected an agent leg and a server leg, got {len(legs)}"
     assert assurance_level(legs) == "two-sided"
+
+
+def test_authorization_crosses_the_gateway_boundary() -> None:
+    """[TAP-EVT-AUTHORIZATION, §9.2, provisional]. Until now `authorization` had
+    no wire channel across the Gateway's HTTP boundary at all — the server leg
+    could not see or echo what the agent claimed to be approved under."""
+    http, tap_server, server_events, seen = _harness()
+    client, _ = _agent()
+    passport = client.issue_passport(task_prompt="t", scope=["call:/db"])
+    auth = client.authorize(target_state=TARGET_STATE, authority_state=AUTHORITY_STATE, ttl_s=3600)
+
+    resp = http.post("/db", json={"q": 1},
+                     headers=passport.http_headers("act_test_auth_0001", authorization=auth.to_record()))
+    assert resp.status_code == 200
+    tap_server._reporter.flush()
+
+    assert len(server_events) == 1
+    assert server_events[0]["authorization"]["authz_id"] == auth.authz_id, \
+        "the server leg echoes the caller's claimed approval"
+    # TAP's own carriage is stripped, same as the passport/action-ref headers.
+    assert "x-tap-authorization" not in {k.lower() for k in seen[0].headers}
+
+
+def test_expired_authorization_is_denied_at_the_gateway() -> None:
+    """Defense in depth: the Gateway applies [TAP-AUTHORITY-VALIDITY] itself
+    rather than trusting a non-compliant Signer to have checked before it signed."""
+    http, tap_server, server_events, seen = _harness()
+    client, _ = _agent()
+    passport = client.issue_passport(task_prompt="t", scope=["call:/db"])
+    expired = Authorization.from_record({
+        **client.authorize(target_state=TARGET_STATE, authority_state=AUTHORITY_STATE).to_record(),
+        "exp": int(__import__("time").time()) - 3600,
+    })
+
+    resp = http.post("/db", json={"q": 1},
+                     headers=passport.http_headers("act_test_auth_0002", authorization=expired.to_record()))
+    assert resp.status_code == 403
+    assert resp.json()["error"] == "DENIED_AUTHORITY_EXPIRED"
+    assert not seen, "an expired approval must never reach the upstream"
+
+    tap_server._reporter.flush()
+    assert server_events[0]["result"]["code"] == "DENIED_AUTHORITY_EXPIRED"
+    assert server_events[0]["authorization"]["authz_id"] == expired.authz_id
+
+
+def test_reused_authz_id_is_denied_at_the_gateway() -> None:
+    """[TAP-AUTHORITY-REUSE, §9.2, provisional]: a second presentation of the
+    same authz_id at this accept boundary must be rejected — even under a
+    fresh passport (a distinct `jti`), so this is genuinely the authz_id check
+    firing and not just [TAP-REPLAY]'s passport-jti defense."""
+    http, tap_server, server_events, seen = _harness()
+    client, _ = _agent()
+    auth = client.authorize(target_state=TARGET_STATE, authority_state=AUTHORITY_STATE, ttl_s=3600)
+
+    passport_1 = client.issue_passport(task_prompt="t", scope=["call:/db"])
+    first = http.post("/db", json={"q": 1}, headers=passport_1.http_headers(
+        "act_test_auth_0003a", authorization=auth.to_record()))
+    assert first.status_code == 200
+
+    passport_2 = client.issue_passport(task_prompt="t", scope=["call:/db"])
+    assert passport_2.claims["jti"] != passport_1.claims["jti"], "a genuinely fresh passport"
+    second = http.post("/db", json={"q": 1}, headers=passport_2.http_headers(
+        "act_test_auth_0003b", authorization=auth.to_record()))
+    assert second.status_code == 403
+    assert second.json()["error"] == "DENIED_AUTHORITY_REUSED"
+    assert len(seen) == 1, "the reused presentation must never reach the upstream"
+
+    tap_server._reporter.flush()
+    denied = [e for e in server_events if e["result"]["code"] == "DENIED_AUTHORITY_REUSED"]
+    assert len(denied) == 1 and denied[0]["authorization"]["authz_id"] == auth.authz_id
 
 
 def test_unattested_call_is_refused() -> None:

@@ -72,14 +72,45 @@ def test_no_nego_by_default() -> None:
         assert "nego" not in (event.get("evidence") or {}), f"event {i} carried nego"
 
 
-def test_requested_is_distinct_from_server() -> None:
-    """`requested` means a server leg was asked for, not that one will arrive."""
+def test_requested_binds_nothing() -> None:
+    """`requested` is an OFFER, and an offer is never bound (§4.1).
+
+    This test previously asserted the opposite — that a passport minted with
+    `attestation="requested"` stamps `nego.attestation == "requested"` — and so
+    locked in a spec violation. §4.1 is explicit: "`attestation: "requested"` is
+    only ever an *offer*; it is not a valid selection", and the Signer "MUST NOT
+    bind an *aspiration*". Binding a request records the Signer's own wish as a
+    negotiated outcome, which makes the anti-downgrade check a restatement of
+    what the Signer hoped for — detecting nothing.
+
+    `negotiate.read_ack` already refused `requested` as a selection on the
+    observed-ack path; only the operator-asserted path admitted it, so the two
+    paths disagreed about the same rule.
+    """
     client, captured = _client()
     passport = client.issue_passport(
         task_prompt="t", scope=["call:tool"], attestation="requested",
     )
     _emit_two(client, passport)
-    assert (captured[0]["evidence"]["nego"])["attestation"] == "requested"
+    for i, event in enumerate(captured):
+        nego = (event.get("evidence") or {}).get("nego")
+        assert nego is None, f"event {i} bound an aspiration: {nego!r}"
+
+
+def test_asserted_server_still_binds() -> None:
+    """An operator-asserted `server` is still bindable — the documented opt-in.
+
+    §4.1 allows binding an outcome "its operator asserts and can stand behind"
+    where the topology is fixed and no handshake rides the wire. That path stays
+    open; only `requested` is excluded, because nobody can stand behind a wish.
+    """
+    client, captured = _client()
+    passport = client.issue_passport(
+        task_prompt="t", scope=["call:tool"], attestation="server",
+    )
+    _emit_two(client, passport)
+    nego = captured[0]["evidence"]["nego"]
+    assert nego["attestation"] == "server", nego
 
 
 def test_invalid_attestation_rejected() -> None:

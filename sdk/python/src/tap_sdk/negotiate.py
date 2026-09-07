@@ -28,6 +28,8 @@ from .core import SPEC_VERSION
 
 HELLO_HEADER = "X-TAP-Hello"
 ACK_HEADER = "X-TAP-Hello-Ack"
+AUTHORIZATION_HEADER = "X-TAP-Authorization"
+SEQ_HEADER = "X-TAP-Seq"
 
 #: Wire versions this implementation can speak, best first.
 SUPPORTED_VERSIONS: tuple[str, ...] = (SPEC_VERSION,)
@@ -187,6 +189,49 @@ def hello_from_headers(headers: Any) -> dict[str, Any] | None:
 
 def ack_from_headers(headers: Any) -> dict[str, Any] | None:
     return from_header(_get_header(headers, ACK_HEADER))
+
+
+def authorization_headers(authorization: dict[str, Any] | None) -> dict[str, str]:
+    """HTTP carriage for `authorization` [§9.2, provisional, §11.1]. Same
+    JSON-in-a-header encoding as the hello/ack headers — this block carries no
+    signature of its own, it is only ever evidence once embedded in a signed
+    Event body."""
+    return {AUTHORIZATION_HEADER: to_header(authorization)} if authorization else {}
+
+
+def authorization_from_headers(headers: Any) -> dict[str, Any] | None:
+    """Read `authorization` from any case-insensitive header mapping. Malformed
+    input degrades to absent, same discipline as `hello_from_headers` — a
+    broken header must never take down the request path."""
+    return from_header(_get_header(headers, AUTHORIZATION_HEADER))
+
+
+def seq_headers(seq: int | None) -> dict[str, str]:
+    """HTTP carriage for the caller's per-action sequence number (§11.1).
+
+    This is what makes ``[TAP-REPLAY]`` enforceable at an action edge. A Passport
+    is legitimately presented on every action of a record, so ``jti`` cannot be
+    the key there; ``(aid, seq)`` can, but only if ``seq`` crosses the wire.
+    Without it a Gateway has no protocol-guaranteed unique value to key on and
+    must say so rather than pretend (see ``TAPServer._check_replay``).
+    """
+    return {SEQ_HEADER: str(seq)} if seq is not None else {}
+
+
+def seq_from_headers(headers: Any) -> int | None:
+    """Read the caller's ``seq`` from any case-insensitive header mapping.
+
+    Unparseable input degrades to absent, the same discipline as a malformed
+    hello: a broken header must never take down the request path, and "absent"
+    already has a defined, honest meaning at the accept boundary.
+    """
+    raw = _get_header(headers, SEQ_HEADER)
+    if raw is None:
+        return None
+    try:
+        return int(raw)
+    except (TypeError, ValueError):
+        return None
 
 
 def _get_header(headers: Any, name: str) -> str | None:

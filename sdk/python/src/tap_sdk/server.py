@@ -5,7 +5,8 @@ inbound call the middleware, **before executing**:
 
   1. verifies the caller's Passport (signature, freshness) against the JWKS,
   2. enforces ``scope_used ⊆ passport.scope`` (drift) and the policy (§9.4),
-  3. rejects a duplicate ``(aid, action_ref)`` (replay defense, [TAP-REPLAY]),
+  3. rejects a replayed call — the ``(aid, seq)`` slot at an action edge, the
+     passport ``jti`` at a delegation edge (replay defense, [TAP-REPLAY]),
 
 then records the handler and signs a **server-attested** Event (``attestor:"server"``)
 echoing the caller's ``action_ref`` so the Verifier can join the two legs.
@@ -47,9 +48,15 @@ from .policy import (
     PolicyRequest,
     evaluate as evaluate_policy,
 )
+from .authority import AuthorityExpired, AuthorityMalformed, check_authority_window
 from .transport import EventReporter, PostFn
 
 KeyResolver = Callable[[str], dict | None]  # kid -> public JWK
+
+#: Which uniqueness guarantee this edge's replay cache keys on [TAP-REPLAY].
+#: See :meth:`TAPServer._check_replay` — the two edges are genuinely different,
+#: and applying the delegation rule to an action edge is an outage, not a defense.
+_REPLAY_SCOPES = frozenset({"action", "delegation"})
 
 
 class UnattestedAction(RuntimeError):
@@ -112,6 +119,7 @@ class TAPServer:
         clock_skew_s: int = 60,
         flush_interval_s: float = 2.0,
         replay_ttl_s: int | None = None,
+        replay_scope: str = "action",
         attests: bool = True,
     ) -> None:
         self.server_id = server_id
@@ -136,15 +144,32 @@ class TAPServer:
                                        flush_interval_s=flush_interval_s)
         self._seq: dict[str, int] = {}        # per-aid server seq space [TAP-EVT-SEQ]
         # Replay cache [TAP-REPLAY]: keyed on the values whose uniqueness the
-        # protocol actually guarantees — the passport `jti` and `(aid, seq)`. It
-        # was previously keyed on `action_ref`, which a replayer simply regenerates,
-        # so it rejected nothing an attacker could not trivially route around.
+        # protocol actually guarantees, and on the one that applies to THIS kind
+        # of edge — see `_check_replay`. Never on `action_ref`, which a replayer
+        # simply regenerates, so it rejected nothing an attacker could not
+        # trivially route around.
         #
         # Entries expire (default: max passport TTL + skew), because a cache that
         # only ever grows is a memory-exhaustion surface reachable by anyone able
         # to mint identifiers — which, on an inbound edge, is everyone.
         self._replay_ttl_s = replay_ttl_s if replay_ttl_s is not None else DEFAULT_TTL_S + clock_skew_s
         self._seen: dict[tuple[str, Any], float] = {}
+        if replay_scope not in _REPLAY_SCOPES:
+            raise ValueError(
+                f"replay_scope must be one of {sorted(_REPLAY_SCOPES)}, got {replay_scope!r}")
+        self.replay_scope = replay_scope
+        # How many accepted calls could not be replay-checked because the caller
+        # supplied no `seq` (see `_check_replay`). Surfaced rather than hidden:
+        # a boundary that silently enforces nothing is worse than one that says so.
+        self.replay_unenforceable = 0
+        # Single-use tracking for `authorization.authz_id` [TAP-AUTHORITY-REUSE,
+        # §9.2, provisional]. Kept separate from `_seen` on purpose: reuse must
+        # stay rejected for the approval's own validity window (its `exp` +
+        # skew), not the generic passport replay TTL — an authz_id minted with a
+        # 24h window must still be single-use after `_replay_ttl_s` (typically
+        # much shorter) has elapsed. Maps authz_id -> its own expiry boundary
+        # (an absolute epoch time), not a "last seen" timestamp.
+        self._authz_seen: dict[str, int] = {}
         self._lock = threading.RLock()  # reentrant: attest() holds it across _emit()
 
     # --- passport verification -----------------------------------------------
@@ -183,6 +208,7 @@ class TAPServer:
         latency_ms: int | None = None,
         error: str | None = None,
         policy_decision: dict | None = None,
+        authorization: dict | None = None,
         result_digest: str | None = None,
     ) -> dict:
         # Digest-only, exactly like the agent leg [TAP-EVT-ENVELOPE]: the server
@@ -229,6 +255,12 @@ class TAPServer:
         }
         if policy_decision is not None:
             body["policy_decision"] = policy_decision
+        if authorization is not None:
+            # [TAP-EVT-AUTHORIZATION, §9.2, provisional] — echoes the caller's
+            # claimed approval onto this independently-signed server leg, so a
+            # Verifier gets two independently-signed records referencing the
+            # same authz_id rather than only the agent's own say-so.
+            body["authorization"] = authorization
         event = sign_event(self._sk, body)
         # The plaintext the digests stand for travels in the unsigned annex
         # [TAP-EVT-ANNEX], where it can be crypto-shredded independently.
@@ -243,14 +275,25 @@ class TAPServer:
     def _check_replay(self, claims: dict, *, seq: int | None) -> str | None:
         """Return a rejection reason for a replayed inbound call, or None.
 
-        Two independent guarantees, per [TAP-REPLAY]:
+        Which key applies depends on what kind of edge this is, and getting that
+        wrong breaks one of the two cases outright [TAP-REPLAY]:
 
-        * ``jti`` uniqueness — one passport, one presentation at this edge;
-        * ``(aid, seq)`` monotonicity — a sequence slot is used once.
+        * ``replay_scope="delegation"`` — an A2A receiving edge, where one
+          Passport presentation *is* one delegation. Here ``jti`` uniqueness is
+          exactly right: a repeat is a replayed handoff.
+        * ``replay_scope="action"`` (the default) — a tool server or Gateway,
+          where a Passport is minted once per record and legitimately attached to
+          **every** action in it (§4.2, §5). Keying on ``jti`` here would reject
+          the second tool call of every record, so the key is ``(aid, seq)``: the
+          per-action slot whose uniqueness the protocol actually guarantees.
 
-        ``seq`` is optional because a caller need not have told us its sequence
-        number; when it is absent the `jti` check still stands on its own. What we
-        must NOT do is fall back to `action_ref`, which the caller picks freely.
+        ``seq`` is carried per §11 (``X-TAP-Seq`` / ``_meta.tap.seq``). When a
+        caller omits it there is nothing protocol-guaranteed-unique left to key
+        on at an action edge — ``action_ref`` is caller-chosen, so a replayer just
+        picks a fresh one — and this method says so by counting the call in
+        ``replay_unenforceable`` rather than inventing a guarantee. It must not
+        fall back to ``jti``: rejecting every legitimate second call is not a
+        replay defense, it is an outage.
         """
         now = time.time()
         with self._lock:
@@ -259,9 +302,15 @@ class TAPServer:
                 cutoff = now - self._replay_ttl_s
                 self._seen = {k: v for k, v in self._seen.items() if v > cutoff}
 
-            keys: list[tuple[str, Any]] = [("jti", claims["jti"])]
+            keys: list[tuple[str, Any]] = []
+            if self.replay_scope == "delegation":
+                keys.append(("jti", claims["jti"]))
             if seq is not None:
                 keys.append((claims["aid"], seq))
+
+            if not keys:
+                self.replay_unenforceable += 1
+                return None
 
             for key in keys:
                 seen_at = self._seen.get(key)
@@ -271,6 +320,35 @@ class TAPServer:
                     return f"replayed {label}"
             for key in keys:
                 self._seen[key] = now
+        return None
+
+    # --- authority-binding reuse defense [TAP-AUTHORITY-REUSE, §9.2, provisional] --
+
+    def _check_authority_reuse(self, authorization: dict, *, now: int) -> str | None:
+        """Return a rejection reason if ``authorization``'s ``authz_id`` was
+        already presented at this accept point, or None.
+
+        Only covers this server's own accept boundary — the one live, stateful
+        point this repo ships (used by the Gateway's own server-attested leg).
+        A full cross-session registry over agent-submitted events needs a
+        hosted ingest Verifier, which is a Service-Profile concern, not this
+        class's.
+        """
+        authz_id = authorization.get("authz_id")
+        if not authz_id:
+            return None
+        exp = authorization.get("exp")
+        boundary = int(exp) + self.clock_skew_s if isinstance(exp, (int, float)) else now
+        with self._lock:
+            # Expire first, so this cache stays bounded by each approval's own
+            # window rather than by uptime.
+            if len(self._authz_seen) > 1024:
+                self._authz_seen = {k: v for k, v in self._authz_seen.items() if v > now}
+
+            seen_boundary = self._authz_seen.get(authz_id)
+            if seen_boundary is not None and seen_boundary > now:
+                return f"reused authz_id {authz_id!r}"
+            self._authz_seen[authz_id] = boundary
         return None
 
     # --- handshake [TAP-NEGOTIATE] -------------------------------------------
@@ -306,13 +384,23 @@ class TAPServer:
         arguments: Any = None,
         intent: str | None = None,
         seq: int | None = None,
+        authorization: dict | None = None,
     ) -> Any:
         """Verify → enforce (pre-execution) → record → sign the execution attestation.
 
         Returns the handler's result. Raises :class:`UnattestedAction` if the
-        passport is missing/invalid, or :class:`ServerDenied` if scope/policy
-        blocks the action before it records (the blocked attempt is still recorded
-        as a signed server ``denied`` event)."""
+        passport is missing/invalid, or :class:`ServerDenied` if scope/policy/
+        authority blocks the action before it records (the blocked attempt is
+        still recorded as a signed server ``denied`` event).
+
+        ``authorization`` (an :meth:`Authorization.to_record`-shaped dict,
+        typically read off ``X-TAP-Authorization`` / ``_meta.tap.authorization``
+        [§11.1/§11.2]) is echoed onto every event this call emits, and checked
+        against its own validity window and single-use at this accept boundary
+        [TAP-AUTHORITY-VALIDITY, TAP-AUTHORITY-REUSE, §9.2, provisional] —
+        defense in depth on top of whatever the agent already checked before
+        signing, since nothing here can compel a non-compliant Signer to have
+        checked at all."""
         claims = self._verify_passport(passport_jwt)
         scope_used = scope_used if scope_used is not None else f"call:{tool}"
         intent = intent or f"Execute {tool}"
@@ -325,15 +413,46 @@ class TAPServer:
                 event=self._emit(
                     claims, kind="denied", intent=intent, tool=tool,
                     scope_used=scope_used, action_ref=action_ref, args=arguments,
-                    status="denied", code="VALIDATION_ERROR", error=replayed),
+                    status="denied", code="VALIDATION_ERROR", error=replayed,
+                    authorization=authorization),
             )
+
+        # Authority binding [TAP-AUTHORITY-VALIDITY, TAP-AUTHORITY-REUSE, §9.2,
+        # provisional]: validity window, then single-use, both pre-execution.
+        if authorization is not None:
+            now = int(time.time())
+            try:
+                check_authority_window(authorization, now=now)
+            except AuthorityMalformed as exc:
+                # Untrusted, unsigned input (§11.1). A block we cannot even read
+                # is not an approval, so it is refused like an invalid one —
+                # never waved through, and never allowed to 500 the request path.
+                ev = self._emit(
+                    claims, kind="denied", intent=intent, tool=tool, scope_used=scope_used,
+                    action_ref=action_ref, args=arguments, status="denied",
+                    code="VALIDATION_ERROR", error=str(exc))
+                raise ServerDenied(str(exc), code="VALIDATION_ERROR", event=ev) from exc
+            except AuthorityExpired as exc:
+                ev = self._emit(
+                    claims, kind="denied", intent=intent, tool=tool, scope_used=scope_used,
+                    action_ref=action_ref, args=arguments, status="denied",
+                    code="DENIED_AUTHORITY_EXPIRED", error=str(exc), authorization=authorization)
+                raise ServerDenied(str(exc), code="DENIED_AUTHORITY_EXPIRED", event=ev) from exc
+
+            reused = self._check_authority_reuse(authorization, now=now)
+            if reused is not None:
+                ev = self._emit(
+                    claims, kind="denied", intent=intent, tool=tool, scope_used=scope_used,
+                    action_ref=action_ref, args=arguments, status="denied",
+                    code="DENIED_AUTHORITY_REUSED", error=reused, authorization=authorization)
+                raise ServerDenied(reused, code="DENIED_AUTHORITY_REUSED", event=ev)
 
         # Drift: scope_used must be authorized by the passport ([TAP-SCOPE-MATCH]).
         if self.enforce and not scope_satisfied(scope_used, claims.get("scope", [])):
             ev = self._emit(
                 claims, kind="denied", intent=intent, tool=tool, scope_used=scope_used,
                 action_ref=action_ref, args=arguments, status="denied",
-                code="DENIED_SCOPE", error="scope not in passport")
+                code="DENIED_SCOPE", error="scope not in passport", authorization=authorization)
             raise ServerDenied(f"scope {scope_used!r} not in passport",
                                code="DENIED_SCOPE", event=ev)
 
@@ -351,7 +470,7 @@ class TAPServer:
                 ev = self._emit(
                     claims, kind="denied", intent=intent, tool=tool, scope_used=scope_used,
                     action_ref=action_ref, args=arguments, status="denied",
-                    code="DENIED_POLICY", policy_decision=pd.to_record())
+                    code="DENIED_POLICY", policy_decision=pd.to_record(), authorization=authorization)
                 raise ServerDenied(f"policy denied {tool!r}", code="DENIED_POLICY",
                                    event=ev, decision=pd)
 
@@ -371,6 +490,7 @@ class TAPServer:
                 status=status, code=code, error=error,
                 latency_ms=round((time.monotonic() - t0) * 1000),
                 policy_decision=pd.to_record() if pd is not None else None,
+                authorization=authorization,
                 result_digest=_result_digest(result) if status == "success" else None,
             )
 
