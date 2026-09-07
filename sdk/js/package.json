@@ -1,6 +1,6 @@
 {
   "name": "@traceableagent/sdk",
-  "version": "0.1.2",
+  "version": "0.1.5",
   "description": "Traceable Agent Protocol (TAP) SDKs \u2014 agent signing (@traceableagent/sdk/agent) and server attestation (@traceableagent/sdk/server).",
   "license": "Apache-2.0",
   "type": "module",
@@ -32,8 +32,8 @@
   ],
   "scripts": {
     "build": "tsc -p tsconfig.json",
-    "test": "tsx test/conformance.ts && tsx test/negativeVectors.test.ts && tsx test/verifierMusts.test.ts && tsx test/nego.test.ts && tsx test/envelopeParity.test.ts && tsx test/instanceSuffix.test.ts",
-    "prepublishOnly": "npm run build"
+    "test": "tsx test/conformance.ts && tsx test/negativeVectors.test.ts && tsx test/verifierMusts.test.ts && tsx test/nego.test.ts && tsx test/envelopeParity.test.ts && tsx test/instanceSuffix.test.ts && tsx test/authority.test.ts && tsx test/instrumentMcp.test.ts && tsx test/regressions.test.ts",
+    "prepare": "npm run build"
   },
   "keywords": [
     "ai-agents",

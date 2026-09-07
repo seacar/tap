@@ -1,6 +1,6 @@
 # Traceable Agent Protocol (TAP) — Specification v0.1
 
-**Status:** Draft · **Version:** 0.1.4 · **Date:** 2026-08-29
+**Status:** Draft · **Version:** 0.1.5 · **Date:** 2026-09-07
 **Steward:** Sworn (https://getsworn.ai) · **License (intended):** Apache-2.0 (spec + reference code)
 **Reference implementation:** `tap_ref.py` · **Conformance vectors:** `test-vectors.json`
 
@@ -17,12 +17,14 @@
 | Version | Example | Changes when |
 |---|---|---|
 | **Wire version** (`v` field, `tap/0.1`) | `tap/0.1` | The envelope changes in a way a conforming Verifier cannot process under the old version. Negotiated per `[TAP-NEGOTIATE]`. |
-| **Document version** | 0.1.2 | Any correction to this specification. |
-| **Package versions** | `traceable-agent-protocol` 0.1.2 | Any release of an SDK. |
+| **Document version** | 0.1.5 | Any correction to this specification. |
+| **Package versions** | `traceable-agent-protocol` 0.1.5 | Any release of an SDK. |
 
 A document patch release does **not** normally change signed bytes. **v0.1.2 is an exception and changes them deliberately:** it corrects places where this document disagreed with its own reference implementation, and where the vectors under-specified the contract. The wire version stays `tap/0.1` because v0.1 has no production deployments to strand. The changed bytes are listed in `CHANGELOG.md`. Any *future* signed-byte change requires a wire-version bump.
 
 **v0.1.3 adds authority binding (§9.2)** — an OPTIONAL `authorization` block and an OPTIONAL `result.effect_digest` field, both omitted per `[TAP-EVT-OMIT]` when unused. Because both are strictly additive and optional, **no v0.1.2 signed record and no existing conformance vector changes.**
+
+**v0.1.5 closes gaps a review found between this document and its own implementations.** No signed bytes change and no vector changes; every addition is a rule that was already assumed, stated normatively because two implementers reading v0.1.4 would have disagreed. `[TAP-ASSURANCE-KEY]` (a `server` leg must not be signed by the agent's key — without it a Signer forges `two-sided` alone, which §7 claims is impossible); `[TAP-ASSURANCE-SEQ]` (agent and server legs keep independent `seq` counters under one `aid`); `[TAP-EVT-CHECKPOINT-LEAVES]` (checkpoint Events consume a `seq` but are never Merkle leaves); `[TAP-REPLAY-EDGE]` and `[TAP-REPLAY-SEQ]` (a Passport is presented on every action of a record, so `jti` uniqueness belongs to the delegation edge only, and `(aid, seq)` needs wire carriage to be enforceable at an action edge); `[TAP-REPLAY-CID]` (an unsigned `_meta` hint may not redirect a chain); plus §3.1/§5.3 on validating the JOSE header's `alg` and on verifier robustness. See `CHANGELOG.md`.
 
 **v0.1.4 gives §9.2 a reference implementation for its stateless half.** `tap_ref.py` now signs/verifies an Event carrying `authorization`, and implements `check_authority_window` (`[TAP-AUTHORITY-VALIDITY]`) and `authority_effect_label` (`[TAP-AUTHORITY-EFFECT]`) as pure functions — mirroring how checkpoint reconciliation is a pure function rather than a stateful service. `test-vectors.json` gained an `authorization` case (existing cases are byte-for-byte unchanged; nothing about them was touched). `[TAP-AUTHORITY-REVOKE]` and `[TAP-AUTHORITY-REUSE]` are **still unimplemented everywhere** — they require a stateful registry, which is a Verifier/Service-Profile concern this file does not have. No production Signer, Verifier, or SDK implements any part of §9.2 yet; §9.2 remains provisional and none of its MUSTs are in §14's Conformance table until that changes. See `CHANGELOG.md` for both entries.
 
@@ -80,7 +82,7 @@ The key words **MUST**, **MUST NOT**, **REQUIRED**, **SHOULD**, **SHOULD NOT**, 
 
 ### 3.1 Signatures · `[TAP-SIG-ALG]`
 
-TAP uses **EdDSA over Curve25519 (Ed25519)**, per RFC 8032 and RFC 8037. The JOSE `alg` value is `EdDSA`. Implementations **MUST** use Ed25519. **MUST NOT** accept `alg: none`. **MUST NOT** accept any other algorithm for a v0.1 session. New algorithms are introduced via suite negotiation (§3.6, §4.1), never by widening an existing session.
+TAP uses **EdDSA over Curve25519 (Ed25519)**, per RFC 8032 and RFC 8037. The JOSE `alg` value is `EdDSA`. Implementations **MUST** use Ed25519. **MUST NOT** accept `alg: none`. **MUST NOT** accept any other algorithm for a v0.1 session. This applies to the **JOSE header's** `alg` as well as the resolving key's declared suite: validating only the key leaves unchecked the one field every historical algorithm-confusion attack targets, and RFC 8725 requires the header be validated against expectations. New algorithms are introduced via suite negotiation (§3.6, §4.1), never by widening an existing session.
 
 ### 3.2 Keys & Key Distribution
 
@@ -256,7 +258,11 @@ Scope tokens are `"<verb>:<resource>"`. `meta` is **never** trusted for a securi
 
 Signing input: `base64url(header) + "." + base64url(claims)`; the Ed25519 signature over its ASCII bytes is the third segment.
 
-A Verifier **MUST**, in order: (1) confirm `typ == tap-passport+jwt` and the session suite; (2) resolve `kid` via JWKS and confirm the key is not revoked as of `iat` (`[TAP-KEY-REVOCATION]`); (3) verify the signature; (4) check freshness within the skew allowance below; (5) treat `aid`/`cid`/`scope` as authoritative only after steps 1–4 pass.
+A Verifier **MUST**, in order: (1) confirm `typ == tap-passport+jwt`, header `alg == EdDSA` (`[TAP-SIG-ALG]`), and the session suite; (2) resolve `kid` via JWKS, confirm the header's `kid` matches the resolving key, and confirm the key is not revoked as of `iat` (`[TAP-KEY-REVOCATION]`); (3) verify the signature; (4) check freshness within the skew allowance below; (5) treat `aid`/`cid`/`scope` as authoritative only after steps 1–4 pass.
+
+Each of these is a rejection, not an assertion in the host language's debug-only sense. An implementation whose checks compile away under an optimization flag — Python's `assert` under `-O`, and equivalents elsewhere — does not conform: under that flag it accepts an expired Passport bearing the wrong `typ` and a mismatched `kid`, and a verification primitive an interpreter flag can disable is not a verification primitive.
+
+**Robustness.** A Verifier **MUST NOT** raise an unhandled error on a record whose signature is valid but whose optional blocks are malformed. A valid signature says nothing about a block's *shape*: a hostile or buggy Signer can validly sign `"authorization": {}` or `"authorization": "hello"`. Such a block **MUST** be surfaced as a conformance defect and the record evaluated around it. Reporting is the one thing an audit tool must survive doing — a verifier one poisoned Event can crash is a verifier an adversary can silence. This does not apply to *enforcement* points reading unsigned transport metadata (§11), which **MUST** fail closed on input they cannot parse.
 
 **Freshness and clock skew.** The allowance is **60 seconds in each direction**, applied as an explicit inequality so it cannot be read two ways:
 
@@ -390,7 +396,7 @@ Implementations **MAY** define namespaced extension kinds prefixed `x-`. Verifie
 
 ### 6.3 Sequence, Integrity, and Checkpoints · `[TAP-EVT-SEQ]` `[TAP-EVT-CHECKPOINT]`
 
-`seq` is a 1-based monotonic counter per `aid`. A Verifier **MUST** flag gaps and duplicates as integrity signals; a duplicate `(aid, seq)` with differing content is a tamper/replay indicator. Both such Events may carry valid signatures — that is precisely why sequence integrity is checked *in addition to* signature verification, never instead of it.
+`seq` is a 1-based monotonic counter per `(aid, attestor)` — see `[TAP-ASSURANCE-SEQ]` (§7): the agent leg and the server leg of one action share an `aid` but come from different Signers keeping independent counters, so pooling them into one space manufactures duplicates on correct records. A Verifier **MUST** flag gaps and duplicates as integrity signals; a duplicate `(aid, attestor, seq)` with differing content is a tamper/replay indicator. Both such Events may carry valid signatures — that is precisely why sequence integrity is checked *in addition to* signature verification, never instead of it.
 
 A bare sequence gap is ambiguous — tampering (an Event was deleted) or benign loss (reporting is fail-open). TAP resolves this with a signed **checkpoint** Event. The Signer **MUST** emit a `checkpoint` at the end of every record (the "seal", §4.2) and **SHOULD** emit one periodically during long-running records:
 
@@ -418,9 +424,13 @@ Note that a `checkpoint` action carries **no** `intent_digest` and no `args_dige
 
 A root mismatch **MUST** be surfaced as an integrity failure, not silently ignored. Reporting a mismatch *as* provable deletion overstates the evidence: a mismatch alone does not identify which Event is missing, or whether one was added.
 
-**Merkle construction (normative).** `event_id_root` commits to the `event_id`s in the half-open interval `(from_seq, through_seq]`, ordered by `seq` ascending. Leaf: `SHA-256(0x00 ‖ utf8(event_id))`. Interior node: `SHA-256(0x01 ‖ left ‖ right)`. The `0x00`/`0x01` domain-separation prefixes prevent leaf/interior confusion and second-preimage attacks. An odd-count level promotes the final node unchanged — it is **not** duplicated. An empty interval yields `event_id_root = "sha256:" + hex(SHA-256(""))`.
+**Checkpoints are not leaves.** `[TAP-EVT-CHECKPOINT-LEAVES]` A `checkpoint` Event consumes a `seq` value like any other Event, so a later checkpoint's interval `(from_seq, through_seq]` will generally *contain* one or more earlier checkpoints. Those checkpoint Events **MUST NOT** be committed as leaves by any `event_id_root`, and a Verifier recomputing a root **MUST** exclude every Event whose `action.kind` is `checkpoint` from the leaf set before hashing. `count` is therefore the number of **non-checkpoint** Events in the interval, and equals the number of leaves the root commits to.
 
-> This is deliberately **not** the Merkle profile of a transparency log. RFC 6962-style profiles hash whole canonical records as leaves and duplicate a lone odd node. A deployment that anchors checkpoint roots into a transparency log (§3.6) therefore runs two distinct constructions and **MUST NOT** share an implementation between them.
+Without this rule the two readings of "the `event_id`s in the interval" differ by exactly the earlier checkpoints, and two conforming implementations compute different roots for the same record while every individual signature verifies — the failure mode `[TAP-EVT-OMIT]` exists to prevent, in the one place a mismatch is reported as an integrity failure rather than a shape defect.
+
+**Merkle construction (normative).** `event_id_root` commits to the `event_id`s of the non-checkpoint Events in the half-open interval `(from_seq, through_seq]`, ordered by `seq` ascending. Leaf: `SHA-256(0x00 ‖ utf8(event_id))`. Interior node: `SHA-256(0x01 ‖ left ‖ right)`. The `0x00`/`0x01` domain-separation prefixes prevent leaf/interior confusion and second-preimage attacks. An odd-count level promotes the final node unchanged — it is **not** duplicated. An empty interval yields `event_id_root = "sha256:" + hex(SHA-256(""))`.
+
+> This is deliberately **not** the Merkle profile of a transparency log. RFC 6962 hashes whole canonical records as leaves and splits each level at the largest power of two below the node count, rather than pairing left-to-right and promoting a lone odd node as TAP does. (Neither duplicates the odd node — that is Bitcoin's construction, and duplicating is what CVE-2012-2459 is about.) A deployment that anchors checkpoint roots into a transparency log (§3.6) therefore runs two distinct constructions and **MUST NOT** share an implementation between them.
 
 ### 6.4 Decision Events — The Counterfactual Ledger · `[TAP-EVT-DECISION]`
 
@@ -502,7 +512,16 @@ The Signer stamps a per-call `action_ref`; a TAP-aware Server or Gateway echoes 
 
 **Consistency predicate (normative).** Two legs sharing the same `(aid, action_ref)` are *consistent* — and the action is `two-sided` — only when they also agree on `cid`, `action.tool`, and `action.kind`, and their results do not contradict. A server `result.status` of `denied`/`failure` against an agent `success`, or differing `result.code`, is a contradiction and yields `conflicting`. A second agent leg or second server leg for the same `action_ref` is a duplicate and is itself an integrity signal.
 
-A compromised Signer can attest false intent but cannot forge the server's independent signature over the actual execution. `conflicting` is a high-signal alert. Implementations **MUST** label assurance honestly and **MUST NOT** imply server attestation that did not occur.
+**Key independence (normative).** `[TAP-ASSURANCE-KEY]` `attestor` is a self-declared string inside a body the Signer controls. A Verifier that reads it at face value is not checking independence at all: an agent simply signs a second leg carrying `attestor: "server"` with its own key, both signatures verify, and the action is labeled `two-sided` — forging the exact property this section claims cannot be forged. Two rules, and the second is the one that matters:
+
+- A leg with `attestor: "server"` whose `kid` equals that of any correlated `attestor: "agent"` leg **MUST** be labeled `conflicting`. This is a structural floor, always applied. It is *not* sufficient on its own — an operator holding two keys still satisfies it.
+- A Verifier **SHOULD** be configured with the set of keys it recognizes as belonging to a TAP-aware Server or Gateway, and **MUST** label `conflicting` any `server` leg signed by a key outside that set. "Independently attested" means attested by a key the Verifier independently associates with a server identity — not merely a different one.
+
+There is no protocol-level way to derive that set: it is a trust relationship the Verifier holds out of band, exactly as it holds the JWKS it resolves keys against. A deployment that cannot state it gets the structural floor and **MUST NOT** describe the result as independent attestation.
+
+A Signer that does not hold a server key can attest false intent but cannot forge the server's independent signature over the actual execution. `conflicting` is a high-signal alert. Implementations **MUST** label assurance honestly and **MUST NOT** imply server attestation that did not occur.
+
+**Sequence spaces.** `[TAP-ASSURANCE-SEQ]` The agent leg and the server leg of one action share a `cid` and an `aid` but are produced by **different Signers with independent counters**. `seq` is therefore monotonic per `(aid, attestor)`, not per `aid` alone, and duplicate detection under `[TAP-EVT-SEQ]` is keyed on `(aid, attestor, seq)`. A Verifier that pools both legs into one `aid`-keyed space reports a duplicate `(aid, seq)` for every two-sided action — a false tamper alert on a correct record, produced by its own bookkeeping.
 
 ---
 
@@ -517,12 +536,23 @@ Multi-agent workflows form a tree. An orchestrator delegating over A2A emits an 
 Replay protection rests on three elements a Verifier and a TAP-aware Server **MUST** enforce:
 
 1. Passport `exp` (short TTL) bounds validity.
-2. `jti` uniqueness — a repeated `jti` is rejected.
+2. `jti` uniqueness **at a delegation edge** — see below.
 3. `(aid, seq)` monotonicity — duplicates/regressions are rejected and flagged.
 
-A receiving A2A Server **SHOULD** keep a short-TTL cache of seen `(aid, seq)` and `jti` to reject duplicate inbound delegations at the edge. Cache TTL **SHOULD** be at least the maximum accepted Passport TTL plus the 60 s skew allowance (`[TAP-PASSPORT-VALIDATE]`).
+**The two edges are different, and the rule differs with them.** `[TAP-REPLAY-EDGE]` Earlier drafts stated `jti` uniqueness unconditionally, which is correct for one edge and an outage on the other:
 
-The cache **MUST** be keyed on `jti` and `(aid, seq)` — the values whose uniqueness the protocol actually guarantees. Keying it on `action_ref` instead does not implement this rule: `action_ref` is a correlation handle the caller chooses freely, so a replayer simply picks a fresh one. Entries **MUST** expire; an unbounded cache is a memory-exhaustion surface reachable by any caller that can mint identifiers.
+| Edge | What one Passport presentation means | Cache key |
+|---|---|---|
+| **Delegation** (an A2A Server receiving a handoff) | one delegation | `jti`, plus `(aid, seq)` when known |
+| **Action** (a tool server or Gateway, §4.3) | one *record*, presented on **every** action in it (§4.2, §5) | `(aid, seq)` only |
+
+A Passport is minted once per record and attached to every action. Rejecting a repeated `jti` at an action edge therefore rejects the second tool call of every record — not a replay defense but a denial of service against correct callers, and one an implementation will not notice if its tests use a fresh Passport per case.
+
+The cache **MUST** be keyed on `jti` and/or `(aid, seq)` per the table — the values whose uniqueness the protocol actually guarantees. Keying it on `action_ref` instead does not implement this rule: `action_ref` is a correlation handle the caller chooses freely, so a replayer simply picks a fresh one. Combining `action_ref` *with* a guaranteed value is the same defect wearing a disguise: the composite admits every replay the guaranteed value alone would have caught. Entries **MUST** expire; an unbounded cache is a memory-exhaustion surface reachable by any caller that can mint identifiers. Cache TTL **SHOULD** be at least the maximum accepted Passport TTL plus the 60 s skew allowance (`[TAP-PASSPORT-VALIDATE]`).
+
+**Carriage of `seq`.** `[TAP-REPLAY-SEQ]` `(aid, seq)` is only enforceable at an action edge if `seq` crosses the wire, so §11 carries it (`X-TAP-Seq`, `_meta.tap.seq`). A Signer **SHOULD** send it; it allocates the slot before dispatch and signs the corresponding Event with the same value, so the header and the leg name one slot rather than two. A Server that receives no `seq` has **no** protocol-guaranteed unique value to key on at that edge, and **MUST** report replay defense as un-enforced for that call rather than silently accepting it as checked or falling back to `jti`.
+
+**Chain splicing.** `[TAP-REPLAY-CID]` A receiving agent **MUST** take the shared `cid` from the sender's *signed* Passport, not from `_meta`. `_meta` is unsigned and caller-controlled, so preferring it lets a caller graft a record onto an unrelated chain (§8.1) while every signature still verifies. Where both are present and disagree, the delegation **MUST** be rejected.
 
 ---
 
@@ -549,7 +579,7 @@ This is deliberately the narrowest possible rule. A matching semantics that gran
 
 ### 9.2 Authority Binding — Bound Approvals (provisional)
 
-> **Status: provisional.** The schema, the validity-window check (`[TAP-AUTHORITY-VALIDITY]`), and the effect-labeling function (`[TAP-AUTHORITY-EFFECT]`) now have a reference implementation in `tap_ref.py` and a fixed vector in `test-vectors.json → authorization` (added in v0.1.4). `[TAP-AUTHORITY-REVOKE]` and `[TAP-AUTHORITY-REUSE]` remain unimplemented — they are inherently stateful (a registry of revoked/consumed ids) and belong to a Verifier or Service Profile, not the stateless reference file. **No production Signer, Verifier, or SDK implements any part of this subsection yet.** None of its MUSTs are included in §14's Conformance table until one does. Track status in `CHANGELOG.md`.
+> **Status: provisional.** The schema, the validity-window check (`[TAP-AUTHORITY-VALIDITY]`), and the effect-labeling function (`[TAP-AUTHORITY-EFFECT]`) have a reference implementation in `tap_ref.py` and all three SDKs (Python, TypeScript, Go), with a fixed vector in `test-vectors.json → authorization` (added in v0.1.4). `[TAP-AUTHORITY-REVOKE]`'s comparison (an already-resolved boundary vs. a record's own signed `ts`) and `[TAP-AUTHORITY-REUSE]`'s batch-local detection (a duplicate `authz_id` within one delivered report) also have reference implementations (Python, TypeScript) — but both remain genuinely incomplete: revocation ships no registry (a caller supplies the resolver; publication format stays a Service Profile concern, as below), and reuse is only checked against a whole live registry at the one stateful accept-point this repo ships (the Gateway's own `TAPServer`, over `X-TAP-Authorization` / `_meta.tap.authorization`, §11.1/§11.2) — a full cross-session registry over agent-submitted events needs a hosted ingest Verifier, which remains a Service Profile's job. Separately: nothing today independently signs the `authorization` block on behalf of `issuer_kid` — it is asserted inside the agent's own signed Event, so these checks make a *named* approval hard to reuse or resurrect, but do not by themselves prove its contents were legitimately granted. **No production Verifier operates a real revocation/reuse registry yet.** None of this subsection's MUSTs are included in §14's Conformance table until the whole class does. Track status in `CHANGELOG.md`.
 
 §9.1's `policy_decision` proves that a *class* of action was permitted under the rules in force. It does not prove that a specific, authentically-signed action stayed within what was actually approved *for that instance*. A Signer holding a validly-scoped Passport and a compliant `policy_decision` can still take an authentic action nobody approved for that particular case — the record would verify perfectly and still be wrong. Authority binding closes that gap by binding one Event to one pre-declared expected effect, under a specific version of the authority governing it, valid only for a bounded window.
 
@@ -626,6 +656,8 @@ The same signed bytes verify identically across all transport bindings.
 - Handshake: `X-TAP-Hello: <json>` / `X-TAP-Hello-Ack: <json>` on the first request.
 - Passport: `X-Agent-Passport: <compact-jwt>`.
 - Correlation: `X-TAP-Action-Ref: <action_ref>`.
+- Replay slot: `X-TAP-Seq: <integer>` — the `(aid, seq)` slot this action occupies (`[TAP-REPLAY-SEQ]`, §8.2). SHOULD be sent; it is the only protocol-guaranteed unique per-action value at an action edge, and `action_ref` is not a substitute because the caller picks it. Omitted, the Server treats replay defense as un-enforced for the call.
+- Authority binding (OPTIONAL, §9.2, provisional): `X-TAP-Authorization: <json>` — the same plain `authorization` object (`authz_id`, `authority_state_version`, `target_state_digest`, `nbf`, `exp`, `issuer_kid`) an Event carries, JSON-encoded the same way as `X-TAP-Hello` (not a JWT — this block carries no signature of its own; it is only ever evidence once embedded in a signed Event body). Lets a TAP-aware Server or Gateway echo the caller's claimed approval onto its own server-attested Event, and lets it apply `[TAP-AUTHORITY-REUSE]`/`[TAP-AUTHORITY-VALIDITY]` at its own accept boundary. Omitted when the caller binds no approval.
 - These ride **alongside** any `Authorization: Bearer` (OAuth) token — TAP adds provenance; it does not replace access control.
 
 ### 11.2 JSON-RPC `_meta` (stdio MCP, A2A Tasks/Messages)
@@ -636,9 +668,13 @@ Where no HTTP headers exist, TAP metadata rides in `_meta`:
 "_meta": { "tap": {
   "hello": { "versions": ["tap/0.1"], "suites": ["tap-ed25519"], "attestation": "requested", "kid": "…" },
   "passport": "<compact-jwt>",
-  "action_ref": "act_…"
+  "action_ref": "act_…",
+  "seq": 7,
+  "authorization": { "authz_id": "auz_…", "authority_state_version": "sha256:…", "target_state_digest": "sha256:…", "nbf": 0, "exp": 0, "issuer_kid": "…" }
 }}
 ```
+
+`authorization` is OPTIONAL (§9.2, provisional) — the same object `X-TAP-Authorization` carries over HTTP, omitted when the caller binds no approval. `seq` is the `_meta` sibling of `X-TAP-Seq` (`[TAP-REPLAY-SEQ]`, §8.2).
 
 A TAP-aware Server reads `_meta.tap`, verifies, and MAY emit a server-attested Event echoing `action_ref`. The `hello` field is included only on the first request of a session.
 
@@ -682,8 +718,8 @@ TAP records provenance; it does **not** provide confidentiality. Transport **SHO
 | Class | MUST implement |
 |---|---|
 | **Signer** | `[TAP-SIG-ALG]`, `[TAP-CANON-JCS]`, `[TAP-CANON-NUMBERS]`; Passport minting + renewal (`[TAP-PASSPORT-LIFECYCLE]`); Event signing over JCS with a digest-only body (`[TAP-EVT-ENVELOPE]`, `[TAP-EVT-OMIT]`); checkpoints (`[TAP-EVT-CHECKPOINT]` — seal MUST, periodic SHOULD); `[TAP-NEGO-BINDING]` where a handshake occurred; §11 carriage; fail-open reporting with annexes |
-| **Verifier** | `[TAP-SUITE-DISPATCH]`, `[TAP-KEY-REVOCATION]`; `[TAP-PASSPORT-VALIDATE]`; `[TAP-EVT-VERIFY]`; `[TAP-EVT-SEQ]` + `[TAP-EVT-CHECKPOINT]` reconciliation and Merkle verification; §8 chain join + `[TAP-REPLAY]`; `[TAP-ASSURANCE]` labeling; `[TAP-SCOPE-MATCH]`; `[TAP-RESULT-CODES]` preservation |
-| **TAP-aware Server / Gateway** | `[TAP-NEGOTIATE]` handshake; Passport verification; `[TAP-ASSURANCE]` server-attested Events echoing `action_ref`; `[TAP-REPLAY]` cache; OPTIONAL policy enforcement (`[TAP-POLICY-RECORD]`) |
+| **Verifier** | `[TAP-SUITE-DISPATCH]`, `[TAP-KEY-REVOCATION]`; `[TAP-PASSPORT-VALIDATE]`; `[TAP-EVT-VERIFY]`; `[TAP-EVT-SEQ]` + `[TAP-EVT-CHECKPOINT]` reconciliation and Merkle verification, excluding checkpoint leaves (`[TAP-EVT-CHECKPOINT-LEAVES]`); §8 chain join + `[TAP-REPLAY]`; `[TAP-ASSURANCE]` labeling **including key independence** (`[TAP-ASSURANCE-KEY]`, `[TAP-ASSURANCE-SEQ]`); `[TAP-SCOPE-MATCH]`; `[TAP-RESULT-CODES]` preservation |
+| **TAP-aware Server / Gateway** | `[TAP-NEGOTIATE]` handshake; Passport verification; `[TAP-ASSURANCE]` server-attested Events echoing `action_ref`; `[TAP-REPLAY]` cache keyed for its own edge (`[TAP-REPLAY-EDGE]`, `[TAP-REPLAY-SEQ]`); OPTIONAL policy enforcement (`[TAP-POLICY-RECORD]`) |
 
 **Passing the vectors.** All classes **MUST** pass `test-vectors.json`, which has two halves and both count:
 
@@ -694,7 +730,7 @@ Reproduction alone is a weak contract: it establishes that an implementation can
 
 A conforming Verifier **MUST** implement suite-driven verification (`[TAP-SUITE-DISPATCH]`) so that future suites require no verifier rewrite, and **MUST** reject any suite it does not recognize rather than fall back to a default.
 
-**Per-implementation coverage.** Conformance is claimed per class, and the SDKs in this repository do not all cover all three. The current matrix is published in `README.md` and **MUST** be kept honest: claiming a class an implementation does not fully cover is the failure mode this whole document exists to prevent.
+**Per-implementation coverage.** Conformance is claimed per class, and the SDKs in this repository do not all cover all three. The current matrix is published in `README.md` under "Conformance" and **MUST** be kept honest: claiming a class an implementation does not fully cover is the failure mode this whole document exists to prevent. For four releases this paragraph pointed at a matrix that did not exist, which is the same failure in a quieter form.
 
 **Authority binding (§9.2) is provisional and out of scope for this table.** None of `[TAP-EVT-AUTHORIZATION]`, `[TAP-AUTHORITY-VALIDITY]`, `[TAP-AUTHORITY-REUSE]`, `[TAP-AUTHORITY-REVOKE]`, or `[TAP-AUTHORITY-EFFECT]` is a MUST for any class above — no reference implementation or conformance vector exists yet. They move into the Signer/Verifier/Server rows once both do.
 

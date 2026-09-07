@@ -16,7 +16,6 @@ from __future__ import annotations
 import base64
 import functools
 import json
-import queue
 import threading
 import time
 import urllib.request
@@ -44,16 +43,27 @@ from .core import (
 )
 from .negotiate import (
     Negotiated,
+    authorization_headers,
     hello_headers,
     offer as build_hello,
     read_ack,
+    seq_headers,
 )
 from .policy import PolicyDecision, PolicyRequest, evaluate as _evaluate_policy
+# One buffered, fail-open reporter, shared with TAPServer. There were two
+# near-identical copies; the signer's had an unbounded flush() that spun forever
+# against an unreachable Verifier, and the fix only ever landed in one of them.
+from .transport import EventReporter
 from .authority import Authorization, AuthorityExpired, check_authority_window
 
 PostFn = Callable[[str, dict, dict], None]
 
 _VALID_ATTESTATION = {"requested", "server", "none"}
+
+#: The extension kind `record_output` emits [TAP-EVT-KIND]. Namespaced because
+#: §6.2's taxonomy is closed apart from the `x-` prefix, and shared verbatim with
+#: the TypeScript SDK so the two compose identical envelopes.
+MODEL_RESPONSE_KIND = "x-model-response"
 
 
 def _suite_id() -> str:
@@ -98,91 +108,6 @@ class PolicyDenied(RuntimeError):
         )
 
 
-def _urllib_post(url: str, payload: dict, headers: dict) -> None:
-    data = json.dumps(payload).encode()
-    req = urllib.request.Request(
-        url, data=data, method="POST",
-        headers={"Content-Type": "application/json", **headers},
-    )
-    with urllib.request.urlopen(req, timeout=5) as resp:
-        resp.read()
-
-
-class _Reporter:
-    """Async, buffered, fail-open event transport (never blocks the agent).
-
-    Each queued item is a ``(event, annex | None)`` pair. Annexes are the
-    unsigned plaintext companions to digest-only signed bodies ([TAP-EVT-ANNEX],
-    spec §11.3). They travel in the same HTTP batch as their events so the Verifier
-    can index them without a second round-trip.
-    """
-
-    def __init__(self, endpoint: str, *, api_key: str | None, post_fn: PostFn | None,
-                 batch_size: int = 50, flush_interval_s: float = 2.0) -> None:
-        self._url = endpoint.rstrip("/") + "/v1/events"
-        self._post = post_fn or _urllib_post
-        self._headers = {"X-API-Key": api_key} if api_key else {}
-        self._batch = batch_size
-        self._interval = flush_interval_s
-        self._q: queue.Queue[tuple[dict, dict | None]] = queue.Queue(maxsize=10_000)
-        self._passport_jwt: str | None = None
-        self._stop = threading.Event()
-        self.dropped = 0
-        threading.Thread(target=self._run, name="tap-reporter", daemon=True).start()
-
-    def set_passport(self, jwt: str) -> None:
-        self._passport_jwt = jwt
-
-    def submit(self, event: dict, annex: dict | None = None) -> None:
-        try:
-            self._q.put_nowait((event, annex))
-        except queue.Full:
-            try:
-                self._q.get_nowait(); self.dropped += 1; self._q.put_nowait((event, annex))
-            except queue.Empty:
-                pass
-
-    def _drain(self) -> list[tuple[dict, dict | None]]:
-        out: list[tuple[dict, dict | None]] = []
-        while len(out) < self._batch:
-            try:
-                out.append(self._q.get_nowait())
-            except queue.Empty:
-                break
-        return out
-
-    def _send(self, batch: list[tuple[dict, dict | None]]) -> None:
-        events = [ev for ev, _ in batch]
-        annexes = [ax for _, ax in batch if ax is not None]
-        payload: dict = {"events": events}
-        if annexes:
-            payload["annexes"] = annexes  # spec §11.3
-        if self._passport_jwt:
-            payload["passport"] = self._passport_jwt
-        try:
-            self._post(self._url, payload, self._headers)
-        except Exception:
-            for pair in batch:
-                self.submit(*pair)  # re-queue on failure; fail-open
-
-    def _run(self) -> None:
-        while not self._stop.is_set():
-            time.sleep(self._interval)
-            batch = self._drain()
-            if batch:
-                self._send(batch)
-
-    def flush(self) -> None:
-        while True:
-            batch = self._drain()
-            if not batch:
-                return
-            self._send(batch)
-
-    def close(self) -> None:
-        self.flush(); self._stop.set()
-
-
 @dataclass
 class Passport:
     compact: str
@@ -218,6 +143,17 @@ class Passport:
             self._seq += 1
             return self._seq
 
+    def reserve_seq(self) -> int:
+        """Allocate this action's ``seq`` *before* dispatching it.
+
+        A Gateway can only enforce ``[TAP-REPLAY]`` at an action edge if the
+        caller tells it which ``(aid, seq)`` slot the call occupies (§11.1
+        ``X-TAP-Seq``) — and the headers are built before the event is signed.
+        Reserving here and passing the same number to :meth:`TAPClient.emit_event`
+        keeps the header and the signed leg on one slot instead of two.
+        """
+        return self.next_seq()
+
     def _track_event(self, event_id: str) -> None:
         """Record an emitted event_id for checkpoint Merkle construction (§6.3)."""
         with self._lock:
@@ -247,37 +183,61 @@ class Passport:
         than claiming intent-only assurance it was never promised."""
         if self.negotiated is not None:
             return self.negotiated.as_nego()
-        if self.attestation == "none":
+        # `requested` is an OFFER, never a selection (§4.1) — binding it would
+        # record an aspiration as a negotiated outcome, which is precisely the
+        # "restatement of the Signer's own wishes" the anti-downgrade check is
+        # meant to exclude. Only an operator-asserted `server` may be bound
+        # without an observed ack, and only as an explicit opt-in.
+        if self.attestation != "server":
             return None
         return {"version": SPEC_VERSION, "suite": _suite_id(),
                 "attestation": self.attestation}
 
     def http_headers(self, action_ref: str | None = None, *,
-                     hello: dict[str, Any] | None = None) -> dict[str, str]:
+                     hello: dict[str, Any] | None = None,
+                     authorization: dict[str, Any] | None = None,
+                     seq: int | None = None) -> dict[str, str]:
         """Passport carriage for HTTP transport (spec §11.1).
 
         Sits alongside any ``Authorization`` header — TAP adds provenance, it
         does not replace access control. Pass ``hello`` on the first request of a
-        session to carry the handshake [TAP-NEGOTIATE]."""
+        session to carry the handshake [TAP-NEGOTIATE]. Pass ``authorization``
+        (an :meth:`Authorization.to_record`-shaped dict) to let a TAP-aware
+        Server or Gateway see the caller's claimed approval [TAP-EVT-AUTHORIZATION,
+        §9.2, provisional] — carried as plain JSON, the same way ``hello`` is,
+        since this block has no signature of its own."""
         h = {"X-Agent-Passport": self.compact}
         if action_ref:
             h["X-TAP-Action-Ref"] = action_ref
         if hello:
             h.update(hello_headers(hello))
+        if authorization:
+            h.update(authorization_headers(authorization))
+        # `seq` is what makes [TAP-REPLAY] enforceable at an action edge; pass
+        # the value from `reserve_seq()` so the header and the signed leg name
+        # the same slot (§11.1).
+        h.update(seq_headers(seq))
         return h
 
     def meta(self, action_ref: str | None = None, *,
-             hello: dict[str, Any] | None = None) -> dict[str, Any]:
+             hello: dict[str, Any] | None = None,
+             authorization: dict[str, Any] | None = None,
+             seq: int | None = None) -> dict[str, Any]:
         """Passport carriage for JSON-RPC ``_meta`` transport (spec §11.2).
 
         The binding for stdio MCP and A2A Tasks/Messages, where no HTTP headers
         exist. The same signed bytes verify identically either way. ``hello`` is
-        included only on the first request of a session."""
+        included only on the first request of a session. ``authorization`` is
+        the same optional approval carried by :meth:`http_headers`."""
         tap: dict[str, Any] = {"passport": self.compact}
         if action_ref:
             tap["action_ref"] = action_ref
         if hello:
             tap["hello"] = hello
+        if authorization:
+            tap["authorization"] = authorization
+        if seq is not None:
+            tap["seq"] = seq
         return {"tap": tap}
 
 
@@ -302,10 +262,21 @@ class TAPClient:
         # Cache the negotiated crypto suite once ([TAP-SUITE-DISPATCH]) — the shape
         # bound into evidence.nego on the first event of each record (§4.1).
         self._suite = suite_for_jwk(public_jwk(self._sk, self.kid))
-        self._reporter = _Reporter(endpoint, api_key=api_key, post_fn=post_fn)
+        self._reporter = EventReporter(endpoint, api_key=api_key, post_fn=post_fn)
         self._passport: Passport | None = None
-        # Inbound-delegation replay cache [TAP-REPLAY]: (sender jti, action_ref).
-        self._a2a_seen: set[tuple[str, Any]] = set()
+        # Inbound-delegation replay cache [TAP-REPLAY]. Keyed on the sender's
+        # passport `jti` ALONE — at a delegation edge one Passport presentation is
+        # one delegation, so `jti` is the guarantee the protocol actually makes.
+        # It must NOT be combined with `action_ref`: that is caller-chosen, so a
+        # replayer keeps the stolen passport and picks a fresh ref, and the
+        # composite key admits every replay it was supposed to stop (§8.2).
+        #
+        # Entries carry an expiry, because §8.2 requires it: an unbounded cache is
+        # a memory-exhaustion surface reachable by anyone who can mint identifiers.
+        # The TTL is the maximum accepted Passport TTL plus the skew allowance,
+        # after which the passport's own `exp` rejects the replay instead.
+        self._a2a_seen: dict[str, float] = {}
+        self._a2a_ttl_s = DEFAULT_TTL_S + 60
         self._a2a_lock = threading.Lock()
 
     # --- passport -------------------------------------------------------------
@@ -430,7 +401,7 @@ class TAPClient:
               parent_event_id: str | None = None, decision: dict | None = None,
               policy_decision: dict | None = None,
               authorization: dict | None = None, effect_digest: str | None = None,
-              extra_annex: dict | None = None) -> dict:
+              seq: int | None = None, extra_annex: dict | None = None) -> dict:
         """Sign one event with a digest-only body ([TAP-EVT-ENVELOPE]).
 
         Plaintext ``intent``, ``args``, and ``reasoning`` go into an unsigned,
@@ -486,7 +457,15 @@ class TAPClient:
         # keeps the canonical form deterministic. `null` and absent are different
         # signed bytes, so two Signers that disagree here produce structurally
         # different events for logically identical actions.
-        result: dict[str, Any] = {"status": status, "code": code, "latency_ms": latency_ms, "error": error}
+        # `error` is explicitly nullable — null means "no error", a value, not an
+        # absence. `latency_ms` is OPTIONAL and MUST be omitted when unmeasured:
+        # `null` and absent are different signed bytes, so emitting a null here
+        # made this SDK compose a structurally different envelope from the
+        # TypeScript one (and from TAPServer's own leg) for the same action
+        # [TAP-EVT-OMIT].
+        result: dict[str, Any] = {"status": status, "code": code, "error": error}
+        if latency_ms is not None:
+            result["latency_ms"] = latency_ms
         if effect_digest is not None:
             # [TAP-AUTHORITY-EFFECT, §9.2, provisional] — omit when unmeasured,
             # never null, matching every other optional field's omit discipline.
@@ -494,7 +473,11 @@ class TAPClient:
 
         body: dict[str, Any] = {
             "v": SPEC_VERSION, "event_id": event_id, "passport_jti": passport.jti,
-            "aid": passport.aid, "cid": passport.cid, "seq": passport.next_seq(),
+            "aid": passport.aid, "cid": passport.cid,
+            # A caller that reserved a slot for `X-TAP-Seq` passes it back here,
+            # so the header the Gateway keyed its replay cache on and the signed
+            # leg name the same `(aid, seq)` rather than two adjacent ones.
+            "seq": passport.next_seq() if seq is None else seq,
             "ts": now_ts(), "action": action,
             "result": result,
             "attestor": attestor, "action_ref": action_ref or new_id("act"),
@@ -694,7 +677,9 @@ class TAPClient:
                 "event_id_root": root,
                 "count": count,
             },
-            "result": {"status": "success", "code": "OK", "latency_ms": None, "error": None},
+            # A checkpoint measures no latency, so `latency_ms` is omitted, not
+            # nulled — same rule as every other optional field [TAP-EVT-OMIT].
+            "result": {"status": "success", "code": "OK", "error": None},
             "attestor": "agent",
             "kid": self.kid,
         }
@@ -716,9 +701,13 @@ class TAPClient:
         text = output if isinstance(output, str) else json.dumps(output, default=str)
         return self._emit(
             p,
-            kind="model_response",
+            # Not one of the seven registered kinds (§6.2), so it MUST be a
+            # namespaced extension. `model_response` bare was neither, which
+            # made every event this helper produced fail the repo's own
+            # event schema [TAP-EVT-KIND].
+            kind=MODEL_RESPONSE_KIND,
             intent=intent,
-            tool="agent.run",
+            tool="agent.record",
             scope_used=scope_used,
             reasoning=reasoning,
             model_output=text,
@@ -836,23 +825,37 @@ class TAPClient:
         except Exception as exc:
             raise DelegationRejected(f"sender passport invalid: {exc}") from exc
 
-        # 2. Replay defense (§8): reject a duplicate (jti, action_ref).
+        # 2. Replay defense (§8, [TAP-REPLAY]): reject a repeated sender `jti`.
         action_ref = tap.get("action_ref")
-        replay_key = (sender_claims["jti"], action_ref)
+        jti = sender_claims["jti"]
+        now_s = time.time()
         with self._a2a_lock:
-            if replay_key in self._a2a_seen:
-                raise DelegationRejected(
-                    f"replayed delegation (jti={sender_claims['jti']})"
-                )
-            self._a2a_seen.add(replay_key)
+            # Expire first, so the cache is bounded by TTL rather than by uptime.
+            if len(self._a2a_seen) > 1024:
+                cutoff = now_s - self._a2a_ttl_s
+                self._a2a_seen = {k: v for k, v in self._a2a_seen.items() if v > cutoff}
+            seen_at = self._a2a_seen.get(jti)
+            if seen_at is not None and (now_s - seen_at) <= self._a2a_ttl_s:
+                raise DelegationRejected(f"replayed delegation (jti={jti})")
+            self._a2a_seen[jti] = now_s
 
         # 3. Accept: mint our own passport on the SAME cid to join the chain.
         # This is a new record with its own assurance expectation, independent
         # of whatever the delegator claimed.
+        # The `cid` comes from the sender's SIGNED passport, never from `_meta`.
+        # `_meta` is unsigned and attacker-controllable, so preferring it would let
+        # a caller splice this record into an unrelated chain (§8.1) while every
+        # signature still verified. `_meta.tap.cid` is accepted only when it agrees.
+        meta_cid = tap.get("cid")
+        signed_cid = sender_claims.get("cid")
+        if meta_cid is not None and signed_cid is not None and meta_cid != signed_cid:
+            raise DelegationRejected(
+                f"_meta.tap.cid {meta_cid!r} contradicts the sender's signed passport cid "
+                f"{signed_cid!r}; an unsigned hint may not redirect the chain")
         receiver = self.issue_passport(
             task_prompt=task_prompt,
             scope=scope,
-            cid=tap.get("cid") or sender_claims.get("cid"),
+            cid=signed_cid or meta_cid,
             attestation=attestation,
         )
 
@@ -868,8 +871,14 @@ class TAPClient:
         )
         return receiver
 
-    def flush(self) -> None:
-        self._reporter.flush()
+    def flush(self, *, timeout_s: float | None = 5.0) -> None:
+        """One bounded delivery attempt for buffered events (§11.3).
 
-    def close(self) -> None:
-        self._reporter.close()
+        Bounded because reporting is fail-open: an unreachable Verifier must
+        cost the agent a timeout, not a hang. Undelivered events stay queued and
+        are counted in ``self._reporter.failed_sends``.
+        """
+        self._reporter.flush(timeout_s=timeout_s)
+
+    def close(self, *, timeout_s: float | None = 5.0) -> None:
+        self._reporter.close(timeout_s=timeout_s)

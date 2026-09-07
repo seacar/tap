@@ -1,7 +1,7 @@
 # Getting started
 
 **Audience:** agent developers and platform engineers  
-**Status:** implementation guide for TAP v0.1.2
+**Status:** implementation guide for TAP v0.1.5
 
 This guide takes an existing agent from no evidence to a signed TAP record.
 
@@ -13,7 +13,10 @@ Packages are currently installed from this repository.
 # Python
 pip install ./sdk/python
 
-# TypeScript
+# TypeScript — both steps are needed from a fresh clone: `dist/` is a build
+# artifact and is not committed, and npm installs a local path as a *symlink*
+# without building it, so the first command is what produces `dist/`.
+npm --prefix sdk/js install
 npm install ./sdk/js
 ```
 

@@ -18,20 +18,31 @@ member ordering, and NFC/NFD distinction.
 Run the conformance tests:
 
 ```bash
+go test ./...        # everything, including the negative vectors
 go test -v ./tap -run TestConformanceVectors
-go run test_negative_vectors.go  # from repo root tap/sdk/go/
 ```
+
+CI runs `go test ./...` on every push. It did not until this was fixed: the Go
+SDK appeared in no CI job and in no line of `scripts/ci-local.sh`, so the repo's
+"change signed bytes and CI will fail" guarantee covered Python and TypeScript
+only, and this SDK could rot silently between releases.
 
 ## Installation
 
 ```bash
-go get github.com/traceable-agent/tap-sdk-go/v2/tap
+go get github.com/traceable-agent-protocol/tap/sdk/go/tap
 ```
+
+The module path must match where the code actually lives, or `go get` cannot
+resolve it. This package is a subdirectory of the `traceable-agent-protocol/tap`
+repository, so that is its import path — the earlier
+`github.com/traceable-agent/tap-sdk-go/v2` named a repository that does not
+exist, and carried a `/v2` suffix for a v0.1 protocol.
 
 ## Quick Start
 
 ```go
-import "github.com/traceable-agent/tap-sdk-go/v2/tap"
+import "github.com/traceable-agent-protocol/tap/sdk/go/tap"
 
 // Generate a new signing key
 sk, seedHex, err := tap.GenerateSigner()

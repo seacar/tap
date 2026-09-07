@@ -32,15 +32,29 @@ from .core import digest, json_digest, new_id
 __all__ = [
     "AuthorityError",
     "AuthorityExpired",
+    "AuthorityMalformed",
+    "AuthorityRevoked",
     "Authorization",
     "authority_state_version",
     "check_authority_window",
+    "check_authority_not_revoked",
     "authority_effect_label",
 ]
 
 
 class AuthorityError(ValueError):
     """Base class for authority-binding errors."""
+
+
+class AuthorityMalformed(AuthorityError):
+    """The ``authorization`` block is present but is not a usable approval.
+
+    Raised only by the *enforcement* path (``check_authority_window``), which is
+    reached with attacker-supplied input from ``X-TAP-Authorization`` /
+    ``_meta.tap.authorization`` and must fail closed. The *labeling* path
+    (``authority_effect_label``) never raises — it is a verifier reading records
+    it did not choose, where one poisoned block must not end the report.
+    """
 
 
 class AuthorityExpired(AuthorityError):
@@ -132,11 +146,68 @@ def check_authority_window(authorization: Authorization | dict, *, now: int) -> 
         nbf - 60 <= now < exp + 60
 
     the same inequality and skew allowance as Passport freshness
-    [TAP-PASSPORT-VALIDATE]. Raises :class:`AuthorityExpired` outside it.
+    [TAP-PASSPORT-VALIDATE]. Raises :class:`AuthorityExpired` outside it, and
+    :class:`AuthorityMalformed` when the block is not a usable approval at all.
+
+    This is an enforcement point reached with untrusted input (the unsigned
+    ``X-TAP-Authorization`` header, §11.1), so a malformed block fails closed
+    rather than raising a raw ``KeyError``/``TypeError`` out of a request path.
     """
-    rec = authorization if isinstance(authorization, Authorization) else Authorization.from_record(authorization)
+    if isinstance(authorization, Authorization):
+        rec = authorization
+    elif isinstance(authorization, dict):
+        try:
+            rec = Authorization.from_record(authorization)
+        except (KeyError, TypeError) as exc:
+            raise AuthorityMalformed(f"authorization block is not a usable approval: {exc}") from exc
+    else:
+        raise AuthorityMalformed(
+            f"authorization must be an object, got {type(authorization).__name__}")
+    if not isinstance(rec.nbf, int) or not isinstance(rec.exp, int):
+        raise AuthorityMalformed("authorization nbf/exp must be integer epoch seconds")
     if not (rec.nbf - 60 <= now < rec.exp + 60):
         raise AuthorityExpired(rec, now=now)
+
+
+class AuthorityRevoked(AuthorityError):
+    """``authz_id`` or ``authority_state_version`` names a revoked approval
+    [TAP-AUTHORITY-REVOKE], and this record is timestamped (by its own signed
+    ``ts``) at or after the revocation boundary — the same effective-time-boundary
+    mechanism as key revocation [TAP-KEY-REVOCATION], applied to an approval
+    instead of a signing key."""
+
+    def __init__(self, *, revoked_id: str, revoked_at: int, signed_ts: int) -> None:
+        self.revoked_id = revoked_id
+        self.revoked_at = revoked_at
+        self.signed_ts = signed_ts
+        super().__init__(
+            f"{revoked_id!r} revoked at {revoked_at}; record is timestamped {signed_ts}"
+        )
+
+
+def check_authority_not_revoked(
+    authz_id: str, authority_state_version: str, revoked_at: int | None, *, signed_ts: int,
+) -> None:
+    """Enforce the revocation boundary [TAP-AUTHORITY-REVOKE].
+
+    ``revoked_at`` is an ALREADY-RESOLVED boundary for whichever of ``authz_id``
+    or ``authority_state_version`` the caller looked up — this function performs
+    no lookup itself and holds no registry. Publication format and query
+    interface are a Service Profile concern (spec §9.2, §15); this is only the
+    comparison. Pass ``None`` when nothing is known to be revoked (the common
+    case): a Verifier with no revocation resource wired in should call this with
+    ``revoked_at=None`` rather than skip the call, so the "nothing revoked" path
+    is exercised the same way as every other outcome.
+
+    Raises :class:`AuthorityRevoked` when ``signed_ts >= revoked_at`` — an
+    effective-time boundary, not blanket repudiation: a record signed before
+    the boundary stays valid, same as key revocation.
+    """
+    if revoked_at is None:
+        return
+    if signed_ts >= revoked_at:
+        revoked_id = authz_id or authority_state_version
+        raise AuthorityRevoked(revoked_id=revoked_id, revoked_at=revoked_at, signed_ts=signed_ts)
 
 
 def authority_effect_label(authorization: Authorization | dict | None, result: dict) -> str | None:
@@ -145,7 +216,9 @@ def authority_effect_label(authorization: Authorization | dict | None, result: d
 
     Returns ``None`` when no ``authorization`` is present (the label does not
     apply); otherwise one of ``"authorized_match"`` / ``"authorized_mismatch"``
-    / ``"unverified_authority"``. Reported ALONGSIDE two-sided assurance
+    / ``"unverified_authority"`` / ``"malformed_authority"`` (the block is
+    present and signed, but is not a usable approval — reported, never raised;
+    see the shape note in the body). Reported ALONGSIDE two-sided assurance
     [TAP-ASSURANCE], never in place of it — an Event can be independently
     two-sided (execution attested by an independent key) and simultaneously
     ``authorized_mismatch`` (the attested execution did something other than
@@ -155,9 +228,20 @@ def authority_effect_label(authorization: Authorization | dict | None, result: d
     """
     if authorization is None:
         return None
-    target = (authorization.target_state_digest if isinstance(authorization, Authorization)
-              else authorization["target_state_digest"])
-    effect = result.get("effect_digest")
+    # `authorization` arrives from a signed body, and a valid signature says
+    # nothing about a block's SHAPE — a hostile or buggy Signer can sign
+    # `"authorization": {}` or `"authorization": "hello"` just as validly. A
+    # verifier that raises on those is a verifier one poisoned event can take
+    # down, which is why this returns a label rather than propagating.
+    if isinstance(authorization, Authorization):
+        target = authorization.target_state_digest
+    elif isinstance(authorization, dict):
+        target = authorization.get("target_state_digest")
+    else:
+        return "malformed_authority"
+    if not isinstance(target, str):
+        return "malformed_authority"
+    effect = result.get("effect_digest") if isinstance(result, dict) else None
     if effect is None:
         return "unverified_authority"
     return "authorized_match" if effect == target else "authorized_mismatch"

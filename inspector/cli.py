@@ -80,7 +80,8 @@ def verify_command(args: argparse.Namespace) -> int:
         passport_compact = core.load_passport(args.passport_file or args.passport_compact).compact
     events = [_load_json_arg(f) for f in (args.event_file or [])]
     events += [_load_json_arg(j) for j in (args.event_json or [])]
-    report = core.verify(jwks_source=args.jwks, passport_compact=passport_compact, events=events)
+    report = core.verify(jwks_source=args.jwks, passport_compact=passport_compact, events=events,
+                         revocations_source=args.revocations)
     _print(report)
     return 0
 
@@ -109,8 +110,12 @@ def show_chain_command(args: argparse.Namespace) -> int:
         passport = core.load_passport(passport_text)
         events = [_load_json_arg(f) for f in (args.event_file or [])]
         resolve_key = core.make_resolver(args.jwks)
+        resolve_authority_revocation = (
+            core.make_revocation_resolver(args.revocations) if args.revocations else None
+        )
         local_record = core.build_record_from_local(
-            passport_claims=passport.claims, events=events, resolve_key=resolve_key)
+            passport_claims=passport.claims, events=events, resolve_key=resolve_key,
+            resolve_authority_revocation=resolve_authority_revocation)
         record = V.annotate_assurance(local_record)
 
     if args.json:
@@ -162,10 +167,15 @@ def build_parser() -> argparse.ArgumentParser:
     verify.add_argument("--passport-compact")
     verify.add_argument("--event-file", action="append", help="repeatable; path to a signed event JSON")
     verify.add_argument("--event-json", action="append", help="repeatable; literal event JSON")
+    verify.add_argument("--revocations",
+                        help="optional: a local JSON file/literal {authz_id_or_version: revoked_at} "
+                             "map [TAP-AUTHORITY-REVOKE, §9.2, provisional] — a debugging convenience, "
+                             "not a registry this tool operates")
     verify.set_defaults(func=verify_command)
 
     chain = sub.add_parser("show-chain", help="visualize a record's chain")
     chain.add_argument("--jwks", help="Verifier base URL or a local JWKS JSON file (local mode)")
+    chain.add_argument("--revocations", help="see `verify --revocations`")
     chain.add_argument("--passport-file")
     chain.add_argument("--passport-compact")
     chain.add_argument("--event-file", action="append", help="repeatable")

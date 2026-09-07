@@ -135,27 +135,58 @@ def make_resolver(jwks_source: str) -> KeyResolver:
         keys = {}
     return keys.get
 
+# (authz_id, authority_state_version) -> revoked_at, or None [TAP-AUTHORITY-REVOKE,
+# §9.2, provisional]. Mirrors KeyResolver's shape.
+AuthorityRevocationResolver = Callable[[str, str], int | None]
+
+def make_revocation_resolver(source: str) -> AuthorityRevocationResolver:
+    """``source`` is a local JSON file or literal JSON text (detected the same
+    way `make_resolver` detects literal JSON vs. a file path): a flat mapping
+    of ``{authz_id_or_authority_state_version: revoked_at}``.
+
+    This is a convenience loader for local/offline debugging, same as
+    `make_resolver` is for JWKS — NOT a registry this repo operates. Publication
+    format and query interface are a Service Profile concern (spec §9.2, §15);
+    a real deployment (Sworn, or a self-hoster) supplies its own resolver.
+    """
+    source = source.strip()
+    data = json.loads(source) if source.startswith("{") else json.loads(Path(source).read_text())
+    return lambda authz_id, authority_state_version: (
+        data.get(authz_id) if authz_id in data else data.get(authority_state_version)
+    )
+
 def verify(*, jwks_source: str, passport_compact: str | None = None,
-          events: list[dict] | None = None) -> dict:
+          events: list[dict] | None = None,
+          revocations_source: str | None = None) -> dict:
     """Dispatch to `verifier.verify`'s existing functions — no new verification
     logic. Passport + events -> Audit-in-a-Box report; passport only -> passport
-    validity; events only -> per-event signature/drift evaluation."""
+    validity; events only -> per-event signature/drift evaluation.
+
+    ``revocations_source``, if given, is loaded via `make_revocation_resolver`
+    and wired into the [TAP-AUTHORITY-REVOKE] check — display/audit only, same
+    as everything else this tool does; see that function's docstring."""
     resolve_key = make_resolver(jwks_source)
+    resolve_authority_revocation = (
+        make_revocation_resolver(revocations_source) if revocations_source else None
+    )
     events = events or []
     if passport_compact and events:
-        return V.verify_transcript(passport_compact, events, resolve_key=resolve_key)
+        return V.verify_transcript(passport_compact, events, resolve_key=resolve_key,
+                                   resolve_authority_revocation=resolve_authority_revocation)
     if passport_compact:
         return V.check_passport(passport_compact, resolve_key=resolve_key)
     if events:
         results = [
-            V.evaluate_event(e, resolve_key=resolve_key, passport_claims=None, last_seq=None)
+            V.evaluate_event(e, resolve_key=resolve_key, passport_claims=None, last_seq=None,
+                             resolve_authority_revocation=resolve_authority_revocation)
             for e in events
         ]
         return {"events": results}
     raise ValueError("verify() needs a passport and/or events to check")
 
 def build_record_from_local(*, passport_claims: dict | None, events: list[dict],
-                            resolve_key: KeyResolver) -> dict:
+                            resolve_key: KeyResolver,
+                            resolve_authority_revocation: AuthorityRevocationResolver | None = None) -> dict:
     """Assemble the same record shape `verifier.store.InMemoryStore.get_record`
     produces, from local passport+events instead of a database, so
     `V.annotate_assurance` can run over it unmodified — the offline chain view
@@ -166,10 +197,16 @@ def build_record_from_local(*, passport_claims: dict | None, events: list[dict],
     for ev in ordered:
         attestor = ev.get("attestor", "agent")
         res = V.evaluate_event(ev, resolve_key=resolve_key, passport_claims=passport_claims,
-                               last_seq=last_seq_by_attestor.get(attestor))
+                               last_seq=last_seq_by_attestor.get(attestor),
+                               resolve_authority_revocation=resolve_authority_revocation)
         stored.append({
             "raw": ev, "sig_valid": res["sig_valid"], "drift": res["drift"],
             "drift_reason": res["drift_reason"], "integrity": res["integrity"],
+            # [TAP-EVT-AUTHORIZATION / TAP-AUTHORITY-EFFECT / TAP-AUTHORITY-REVOKE,
+            # §9.2, provisional] — display-only, same as everything else here: no
+            # enforcement, just a read of what evaluate_event already computed.
+            "authorization": res["authorization"], "authority_effect": res["authority_effect"],
+            "authority_revoked": res["authority_revoked"],
         })
         if isinstance(ev.get("seq"), int):
             last_seq_by_attestor[attestor] = ev["seq"]
@@ -202,11 +239,22 @@ def _render_record_lines(record: dict) -> str:
         level = rec.get("assurance", "?")
         nego = " NEGO-MISMATCH" if rec.get("nego_mismatch") else ""
         action = raw.get("action") or {}
-        lines.append(
+        line = (
             f"  [{raw.get('seq')}] {mark} {action.get('kind'):<20} "
             f"tool={action.get('tool')!r} attestor={raw.get('attestor'):<6} "
             f"assurance={level}{nego}"
         )
+        # [TAP-EVT-AUTHORIZATION / TAP-AUTHORITY-EFFECT / TAP-AUTHORITY-REVOKE,
+        # §9.2, provisional] — display-only: enforcement (window, single-use)
+        # happens elsewhere; this just shows what evaluate_event computed.
+        authorization = rec.get("authorization")
+        if authorization:
+            revoked = " REVOKED" if rec.get("authority_revoked") else ""
+            line += (
+                f" authz={authorization.get('authz_id')} "
+                f"authority_effect={rec.get('authority_effect')}{revoked}"
+            )
+        lines.append(line)
     return "\n".join(lines)
 
 def render_chain_ascii(record_or_chain: dict) -> str:

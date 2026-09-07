@@ -36,9 +36,20 @@ The script exercises:
 - reference-vector generation and self-checks;
 - quoted spec values against the vector file;
 - schemas against the vectors;
-- Python SDK tests;
-- TypeScript SDK tests;
+- Python, TypeScript, and Go SDK tests;
+- regression tests for defects that shipped once;
+- cross-language envelope parity — both SDKs' *composed* events diffed against
+  each other and validated against the published schema;
 - Gateway and Inspector tests.
+
+The parity check is separate from the vectors on purpose. A vector proves an
+implementation can re-sign a body someone else composed; it says nothing about
+the body that implementation composes on its own, which is where the two SDKs
+actually diverged.
+
+Per-implementation coverage, including the classes these SDKs do **not** fully
+cover, is published in the [README's conformance matrix](../README.md#conformance)
+as §14 requires.
 
 ## Changes to signed bytes
 

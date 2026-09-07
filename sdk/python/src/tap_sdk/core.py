@@ -132,6 +132,29 @@ class RevokedKey(ValueError):
     """
 
 
+class InvalidRecord(ValueError):
+    """A record failed a non-signature validation check [TAP-PASSPORT-VALIDATE],
+    [TAP-EVT-VERIFY]: wrong ``typ``, a ``kid`` that does not match the resolving
+    key, an unacceptable JOSE ``alg``, or a freshness window violation.
+
+    These are raised, never ``assert``ed. Every check below is load-bearing
+    security logic, and ``python -O`` / ``PYTHONOPTIMIZE=1`` strips ``assert``
+    statements entirely — under which an assertion-based verifier silently
+    accepts an expired Passport with the wrong ``typ`` and a mismatched ``kid``.
+    A verification primitive that can be disabled by an interpreter flag is not
+    a verification primitive.
+    """
+
+
+class PassportExpired(InvalidRecord):
+    """The Passport is outside its freshness window, skew allowance included.
+
+    A distinct type so a caller can tell "this credential aged out" — routine,
+    renew and retry (§4.2) — from "this credential is malformed or was not
+    issued for this key", which is not routine at all.
+    """
+
+
 class UnknownSuite(ValueError):
     """The key declares a crypto suite this implementation does not recognize.
 
@@ -205,20 +228,44 @@ def sign_passport(sk: Ed25519PrivateKey, kid: str, claims: dict) -> str:
 
 
 def verify_passport(jwk: dict, token: str, now: int | None = None) -> dict:
-    """Validate a Passport [TAP-PASSPORT-VALIDATE]."""
+    """Validate a Passport [TAP-PASSPORT-VALIDATE].
+
+    Every check here raises rather than asserts. See :class:`InvalidRecord` —
+    under ``python -O`` an assertion-based version of this function accepts an
+    expired Passport bearing the wrong ``typ`` and a mismatched ``kid``.
+    """
     suite_for_jwk(jwk)  # dispatch off the declared suite; raises on unknown
     now = int(time.time()) if now is None else now
-    h_b64, p_b64, s_b64 = token.split(".")
+    parts = token.split(".")
+    if len(parts) != 3:
+        raise InvalidRecord("not a compact JWS: expected three dot-separated segments")
+    h_b64, p_b64, s_b64 = parts
     pk = Ed25519PublicKey.from_public_bytes(b64u_dec(jwk["x"]))
     pk.verify(b64u_dec(s_b64), f"{h_b64}.{p_b64}".encode("ascii"))
     header = json.loads(b64u_dec(h_b64))
     claims = json.loads(b64u_dec(p_b64))
-    assert header["typ"] == PASSPORT_TYP, "wrong token type"
-    assert header["kid"] == jwk["kid"], "kid mismatch"
+    # `alg` is pinned to the session suite [TAP-SIG-ALG]: `none` and the RS/HS
+    # families MUST NOT be accepted. Checking the JWK's suite alone leaves the
+    # JOSE header — the field every historical alg-confusion attack targets —
+    # unvalidated, which is also what RFC 8725 requires be checked.
+    if header.get("alg") != "EdDSA":
+        raise InvalidRecord(f"unacceptable JOSE alg {header.get('alg')!r}; v0.1 requires EdDSA")
+    if header.get("typ") != PASSPORT_TYP:
+        raise InvalidRecord(
+            f"wrong token type {header.get('typ')!r}; expected {PASSPORT_TYP!r}")
+    if header.get("kid") != jwk["kid"]:
+        raise InvalidRecord(
+            f"kid mismatch: token says {header.get('kid')!r}, key is {jwk['kid']!r}")
     check_not_revoked(jwk, claims.get("iat"))
     # Freshness with the +/-60 s skew allowance, written as the spec's inequality
     # so the two cannot drift apart [TAP-PASSPORT-VALIDATE].
-    assert claims["iat"] - 60 <= now < claims["exp"] + 60, "passport expired / not yet valid"
+    try:
+        iat, exp = int(claims["iat"]), int(claims["exp"])
+    except (KeyError, TypeError, ValueError) as exc:
+        raise InvalidRecord(f"passport iat/exp missing or unparseable: {exc}") from exc
+    if not (iat - 60 <= now < exp + 60):
+        raise PassportExpired(
+            f"passport expired / not yet valid: iat={iat} exp={exp} now={now}")
     return claims
 
 
@@ -246,7 +293,11 @@ def verify_event(jwk: dict, event: dict) -> bool:
     check_not_revoked(jwk, event.get("ts"))
     pk = Ed25519PublicKey.from_public_bytes(b64u_dec(jwk["x"]))
     pk.verify(b64u_dec(event["sig"]), signing_input(event))
-    assert event["kid"] == jwk["kid"], "kid mismatch"
+    # Raised, not asserted: this binds the signature to the key the caller
+    # resolved, and `python -O` would strip an assert (see `InvalidRecord`).
+    if event.get("kid") != jwk["kid"]:
+        raise InvalidRecord(
+            f"kid mismatch: event says {event.get('kid')!r}, key is {jwk['kid']!r}")
     return True
 
 

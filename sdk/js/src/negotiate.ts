@@ -18,6 +18,7 @@ import { SPEC_VERSION } from "./tap.js";
 
 export const HELLO_HEADER = "X-TAP-Hello";
 export const ACK_HEADER = "X-TAP-Hello-Ack";
+export const AUTHORIZATION_HEADER = "X-TAP-Authorization";
 
 /** Wire versions this implementation speaks, best first. */
 export const SUPPORTED_VERSIONS: readonly string[] = [SPEC_VERSION];
@@ -204,6 +205,22 @@ export function helloFromHeaders(headers: unknown): Record<string, unknown> | nu
 
 export function ackFromHeaders(headers: unknown): Record<string, unknown> | null {
   return fromHeader(getHeader(headers, ACK_HEADER));
+}
+
+/**
+ * HTTP carriage for `authorization` [§9.2, provisional, §11.1]. Same
+ * JSON-in-a-header encoding as the hello/ack headers — this block carries no
+ * signature of its own, it is only ever evidence once embedded in a signed
+ * Event body.
+ */
+export function authorizationHeaders(authorization: object | null | undefined): Record<string, string> {
+  return authorization ? { [AUTHORIZATION_HEADER]: toHeader(authorization) } : {};
+}
+
+/** Read `authorization` from any case-insensitive header bag. Malformed input
+ * degrades to absent, same discipline as {@link helloFromHeaders}. */
+export function authorizationFromHeaders(headers: unknown): Record<string, unknown> | null {
+  return fromHeader(getHeader(headers, AUTHORIZATION_HEADER));
 }
 
 function getHeader(headers: unknown, name: string): string | null {

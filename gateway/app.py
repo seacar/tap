@@ -24,6 +24,22 @@ from fastapi.responses import JSONResponse
 
 from tap_sdk.server import ServerDenied, TAPServer, UnattestedAction
 from tap_sdk.core import digest, new_id
+from tap_sdk.negotiate import authorization_from_headers, seq_from_headers
+
+# The six fields an `authorization` record must carry [TAP-EVT-AUTHORIZATION,
+# §9.2]. `X-TAP-Authorization` is unsigned, untrusted inbound data at this
+# point — a caller can send anything — so a shape that's missing one of these
+# degrades to "no authorization claimed" rather than crashing the request,
+# same discipline `from_header` already applies to malformed JSON.
+_AUTHORIZATION_FIELDS = {
+    "authz_id", "authority_state_version", "target_state_digest",
+    "nbf", "exp", "issuer_kid",
+}
+
+def _well_formed_authorization(parsed: dict | None) -> dict | None:
+    if not parsed or not _AUTHORIZATION_FIELDS <= parsed.keys():
+        return None
+    return parsed
 
 # Stripped both directions: hop-by-hop headers (RFC 7230 §6.1) plus TAP's own
 # carriage headers (the upstream tool knows nothing about TAP) plus
@@ -31,7 +47,8 @@ from tap_sdk.core import digest, new_id
 _STRIP_HEADERS = {
     "connection", "keep-alive", "proxy-authenticate", "proxy-authorization",
     "te", "trailers", "transfer-encoding", "upgrade", "host", "content-length",
-    "x-agent-passport", "x-tap-action-ref",
+    "x-agent-passport", "x-tap-action-ref", "x-tap-authorization",
+    "x-tap-hello", "x-tap-hello-ack", "x-tap-seq",
 }
 
 def _strip_headers(headers) -> dict[str, str]:
@@ -57,6 +74,13 @@ def create_app(*, tap_server: TAPServer, upstream_client: httpx.Client) -> FastA
         body = await request.body()
         passport_jwt = request.headers.get("x-agent-passport")
         action_ref = request.headers.get("x-tap-action-ref") or new_id("act")
+        authorization = _well_formed_authorization(authorization_from_headers(request.headers))
+        # The caller's `(aid, seq)` slot for this action (§11.1). This is the only
+        # protocol-guaranteed unique value at an action edge — a Passport is
+        # legitimately presented on every action of a record, so `jti` is not one
+        # — and without it `TAPServer` reports replay defense as unenforceable
+        # rather than inventing a guarantee [TAP-REPLAY].
+        caller_seq = seq_from_headers(request.headers)
         # Answer the handshake if one was offered [TAP-NEGOTIATE]. The ack rides
         # back on every response it applies to, so a Signer learns the negotiated
         # outcome before it binds `nego` into its first Event. A caller that sent
@@ -85,7 +109,8 @@ def create_app(*, tap_server: TAPServer, upstream_client: httpx.Client) -> FastA
 
         try:
             tap_server.attest(tool=tool, passport_jwt=passport_jwt, action_ref=action_ref,
-                              execute=do_forward)
+                              execute=do_forward, authorization=authorization,
+                              seq=caller_seq)
         except UnattestedAction as exc:
             return JSONResponse({"error": "unattested_action", "detail": str(exc)},
                                 status_code=401, headers=tap_headers)

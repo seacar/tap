@@ -157,6 +157,21 @@ export class UnknownSuite extends Error {
 // v0.1 recognizes only Ed25519. Future suites are registry additions.
 const SUITES = new Map<string, string>([["EdDSA|Ed25519", "tap-ed25519"]]);
 
+/**
+ * The Passport is outside its freshness window, skew allowance included.
+ *
+ * A distinct type so a caller can tell "this credential aged out" — routine,
+ * renew and retry (§4.2) — from "this credential is malformed or was not issued
+ * for this key". Deciding that by searching the error message for the substring
+ * "expired" breaks the moment anyone rewords it.
+ */
+export class PassportExpired extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "PassportExpired";
+  }
+}
+
 /** Resolve a JWK's declared (alg, crv) to a TAP suite id, or throw. */
 export function suiteForJwk(jwk: Partial<Jwk>): string {
   const suite = SUITES.get(`${jwk.alg}|${jwk.crv}`);
@@ -273,18 +288,29 @@ export async function verifyPassport(
   now: number = Math.floor(Date.now() / 1000),
 ): Promise<Record<string, unknown>> {
   suiteForJwk(jwk); // dispatch off the declared suite; throws on unknown (§3.6, §15)
-  const [h, p, s] = token.split(".");
+  const parts = token.split(".");
+  if (parts.length !== 3)
+    throw new Error("not a compact JWS: expected three dot-separated segments");
+  const [h, p, s] = parts;
   const ok = await ed.verifyAsync(b64uToBytes(s), utf8(`${h}.${p}`), b64uToBytes(jwk.x));
   if (!ok) throw new Error("passport signature invalid");
   const header = JSON.parse(new TextDecoder().decode(b64uToBytes(h)));
   const claims = JSON.parse(new TextDecoder().decode(b64uToBytes(p)));
+  // `alg` is pinned to the session suite [TAP-SIG-ALG]: `none` and the RS/HS
+  // families MUST NOT be accepted. Checking the JWK's suite alone leaves the
+  // JOSE header — the field every historical alg-confusion attack targets —
+  // unvalidated, which is also what RFC 8725 requires be checked.
+  if (header.alg !== "EdDSA")
+    throw new Error(`unacceptable JOSE alg ${JSON.stringify(header.alg)}; v0.1 requires EdDSA`);
   if (header.typ !== PASSPORT_TYP) throw new Error("wrong token type");
   if (header.kid !== jwk.kid) throw new Error("kid mismatch");
   checkNotRevoked(jwk, claims.iat as number);
   // Freshness with the +/-60 s skew allowance, written as the spec's inequality so
   // the two cannot drift apart [TAP-PASSPORT-VALIDATE].
   if (!((claims.iat as number) - 60 <= now && now < (claims.exp as number) + 60))
-    throw new Error("passport expired / not yet valid");
+    throw new PassportExpired(
+      `passport expired / not yet valid: iat=${claims.iat} exp=${claims.exp} now=${now}`,
+    );
   return claims;
 }
 

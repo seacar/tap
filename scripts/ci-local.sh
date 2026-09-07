@@ -56,6 +56,7 @@ run "handshake + nego binding"    python3 tests/test_handshake.py
 run "anti-downgrade (nego)"       python3 tests/test_nego.py
 run "policy engine"               python3 tests/test_policy.py
 run "authority binding (§9.2)"    python3 tests/test_authority.py
+run "regressions (shipped once)"  python3 tests/test_regressions.py
 run "instance suffix"             python3 tests/test_instance_suffix.py
 run "core imports w/o network deps" \
   python3 -c "import tap_sdk.core, tap_sdk.verify"
@@ -76,6 +77,19 @@ fi
 run "conformance + MUSTs + unit tests" npm test
 run "type check / build"               npm run build
 popd >/dev/null
+
+echo
+echo "go SDK"
+# The Go SDK shipped in the README's repository map and in "three SDKs
+# cross-checked against one reference implementation", while appearing in no CI
+# job and no line of this script. Anyone could change signed bytes and it would
+# have kept compiling against the old shape until someone ran it by hand.
+if command -v go >/dev/null 2>&1; then
+  run "vet"                            bash -c 'cd sdk/go && go vet ./...'
+  run "vectors, negatives, authority"  bash -c 'cd sdk/go && go test ./...'
+else
+  printf '  %-46s %s\n' "go test" "SKIP (no go toolchain — CI runs it)"
+fi
 
 echo
 echo "gateway + inspector"
@@ -99,6 +113,12 @@ run "both reject the same negatives" \
 # someone else composed. This proves the two COMPOSE identical bytes.
 run "the two SDKs compose identical envelopes" \
   bash -c 'cd sdk/js && npx tsx test/envelopeParity.test.ts && cd ../python && PYTHONPATH=src python3 tests/test_envelope_parity.py'
+# ...and the check that actually DIFFS them, across every event kind, and
+# validates both SDKs' composed events against the published schema. The step
+# above asserts a rule about ONE SDK's output for ONE kind, which is how three
+# real divergences lived in main while it passed.
+run "both SDKs emit identical shapes + match schema" \
+  python3 scripts/check-envelope-parity.py
 run "a JS-signed record verifies in python" \
   bash -c 'cd sdk/js && npx tsx test/interop.ts > /tmp/js_event.json && cd ../python && PYTHONPATH=src python3 -c "
 import json
