@@ -1,6 +1,6 @@
 {
   "name": "@traceableagent/sdk",
-  "version": "0.1.5",
+  "version": "0.1.6",
   "description": "Traceable Agent Protocol (TAP) SDKs \u2014 agent signing (@traceableagent/sdk/agent) and server attestation (@traceableagent/sdk/server).",
   "license": "Apache-2.0",
   "type": "module",
@@ -56,11 +56,11 @@
   },
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/traceable-agent-protocol/tap.git",
+    "url": "git+https://github.com/seacar/tap.git",
     "directory": "sdk/js"
   },
-  "homepage": "https://github.com/traceable-agent-protocol/tap#readme",
+  "homepage": "https://github.com/seacar/tap#readme",
   "bugs": {
-    "url": "https://github.com/traceable-agent-protocol/tap/issues"
+    "url": "https://github.com/seacar/tap/issues"
   }
 }

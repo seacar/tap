@@ -10,13 +10,27 @@ Three version numbers appear in TAP and mean different things:
 |---|---|
 | **Wire version** (`v` field, `tap/0.1`) | The envelope changes such that a conforming Verifier cannot process it under the old version. Negotiated per `[TAP-NEGOTIATE]`. |
 | **Document version** (this changelog) | Any correction to the specification or whitepaper. |
-| **Package versions** (`traceable-agent-protocol`, `@traceableagent/sdk`) | Any SDK release. All three are 0.1.5; they had drifted apart. |
+| **Package versions** (`traceable-agent-protocol`, `@traceableagent/sdk`) | Any SDK release. The single source is `VERSION`; CI asserts `pyproject.toml`, `package.json`, and `tap_sdk.__version__` agree. |
 
 A document patch release does **not** normally change signed bytes. **v0.1.2 is a deliberate exception**, listed in full below. Any *future* signed-byte change requires a wire-version bump.
 
 ---
 
-## [Unreleased]
+## [0.1.6] — 2026-09-08
+
+Packaging and tree-consistency release. **No signed bytes change.** Packages are not published to PyPI/npm in this step.
+
+The two `stash` commits `33771af` and `2c75a2b` are **siblings** off `a4ac5fb`, not a linear pair. `c09cf8a` reverted only `2c75a2b`, which left `33771af`'s TypeScript exports pointing at files that lived only on the other branch. This release keeps `33771af`'s Python/JS sources and restores the files `2c75a2b` added (`authority.ts`, `instrumentMcp.ts`, envelope-parity, Go `authority.go`, regression tests). §9.2 remains provisional and is in no §14 conformance class.
+
+### Added
+
+- **`tap_sdk.gateway`**, installed behind `pip install 'traceable-agent-protocol[gateway]'`. The FastAPI proxy that used to live only at `gateway/` (not in the wheel) is now part of the package. `gateway/` remains a thin shim.
+- **`scripts/check-versions.py`** — CI fails if the three package versions disagree.
+
+### Changed
+
+- Package version is **0.1.6** (`VERSION`, `pyproject.toml`, `package.json`, `tap_sdk.__version__`).
+- Repository URLs in `pyproject.toml` and `package.json` point at `github.com/seacar/tap` (the actual remote).
 
 Gives §9.2 authority binding TypeScript and Go parity with the Python SDK, makes it visible in the Inspector, closes the MCP scope question, gives TypeScript its own MCP client-side wrapper, lets `authorization` cross the Gateway's HTTP boundary, and adds resolver-based revocation detection plus batch-local and Gateway-side reuse detection. No signed bytes change — `test-vectors.json` is unmodified; every SDK tests against the *same* fixed numbers, and the new Gateway header/field are OPTIONAL and additive.
 

@@ -31,6 +31,8 @@ jobs:
       # or they are documentation that silently drifts.
       - name: Schemas and registries describe the vectors
         run: python3 scripts/check-schemas.py
+      - name: Package versions agree
+        run: python3 scripts/check-versions.py
 
   python-sdk:
     name: Python SDK
@@ -130,6 +132,8 @@ jobs:
       # is not TAP-aware, and the Inspector is what an implementer debugs with.
       # Neither had a single test, or appeared in CI, before v0.1.2.
       - name: Gateway (handshake, pass-through, independent server leg)
+        env:
+          PYTHONPATH: sdk/python/src
         run: python3 gateway/test_gateway.py
       - name: Inspector (agrees with the SDK it wraps)
         run: python3 inspector/test_inspector.py
@@ -211,8 +215,13 @@ jobs:
       - name: pip install the package and import it
         run: |
           python3 -m venv /tmp/clean
-          /tmp/clean/bin/pip install --quiet ./sdk/python
+          /tmp/clean/bin/pip install --quiet './sdk/python[http]'
           /tmp/clean/bin/python -c "from tap_sdk import TAPClient; import tap_sdk.verify; print('ok - traceable-agent-protocol imports')"
+      - name: pip install the gateway extra and import it
+        run: |
+          python3 -m venv /tmp/gw
+          /tmp/gw/bin/pip install --quiet './sdk/python[gateway]'
+          /tmp/gw/bin/python -c "from tap_sdk.gateway import create_app; print('ok - tap_sdk.gateway imports')"
       # The README's own two commands, verbatim — no `npm run build` first.
       # That extra build is exactly why this job never caught the quickstart
       # being broken: `dist/` is gitignored and the build hook was

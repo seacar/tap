@@ -44,6 +44,7 @@ rm -f /tmp/tap-committed-vectors.json
 # because nothing compared them to the vectors.
 run "spec agrees with the vectors"     python3 scripts/check-spec-vectors.py
 run "schemas + registries describe it" python3 scripts/check-schemas.py
+run "package versions agree"           python3 scripts/check-versions.py
 
 echo
 echo "python SDK"

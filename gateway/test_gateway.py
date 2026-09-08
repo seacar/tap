@@ -28,7 +28,7 @@ sys.path.insert(0, str(REPO))
 import httpx  # noqa: E402
 from fastapi.testclient import TestClient  # noqa: E402
 
-from gateway.app import create_app  # noqa: E402
+from tap_sdk.gateway.app import create_app  # noqa: E402
 from tap_sdk import Authorization, TAPClient  # noqa: E402
 from tap_sdk.core import load_signer, public_jwk  # noqa: E402
 from tap_sdk.negotiate import ACK_HEADER, HELLO_HEADER, to_header  # noqa: E402

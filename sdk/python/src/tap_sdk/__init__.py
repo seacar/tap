@@ -48,7 +48,7 @@ from .agent_id import resolve_agent_id
 from .signer import DelegationRejected, Passport, PolicyDenied, TAPClient
 from .tracer import TAPTracer, Tenant, TraceSession
 
-__version__ = "0.1.3"
+__version__ = "0.1.6"
 
 # `VerifierAPI` is the only part of this package that talks HTTP, and `httpx` is an
 # OPTIONAL dependency (`pip install traceable-agent-protocol[http]`). Importing it

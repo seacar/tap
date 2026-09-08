@@ -121,7 +121,7 @@ See [Getting started](docs/getting-started.md) before using TAP in production.
 | [sdk/python/](sdk/python/) | Python signer, verifier, and server primitives |
 | [sdk/js/](sdk/js/) | TypeScript signer, verifier, and server primitives |
 | [sdk/go/](sdk/go/) | Go signer and verification primitives |
-| [gateway/](gateway/) | TAP-aware boundary for unchanged upstream services |
+| [gateway/](gateway/) | Thin shim; the Gateway ships as `tap_sdk.gateway` (`pip install 'traceable-agent-protocol[gateway]'`) |
 | [inspector/](inspector/) | Local record inspection and debugging tool |
 | [schemas/](schemas/) | JSON Schemas |
 | [registries/](registries/) | Cryptographic suite and result-code registries |
