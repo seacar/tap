@@ -267,6 +267,21 @@ export async function signPassport(
   return seg + "." + b64u(sig);
 }
 
+/**
+ * A Passport's freshness window [TAP-PASSPORT-VALIDATE] excludes `now`.
+ *
+ * A distinct type from the other structural failures verifyPassport can throw
+ * (wrong typ, mismatched kid, forged alg) so a caller can tell "this passport
+ * aged out" — an expected, common outcome — from "this token is malformed or
+ * fraudulent".
+ */
+export class PassportExpired extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "PassportExpired";
+  }
+}
+
 export async function verifyPassport(
   jwk: Jwk,
   token: string,
@@ -278,13 +293,19 @@ export async function verifyPassport(
   if (!ok) throw new Error("passport signature invalid");
   const header = JSON.parse(new TextDecoder().decode(b64uToBytes(h)));
   const claims = JSON.parse(new TextDecoder().decode(b64uToBytes(p)));
+  // §3.1: checking the JWK's suite alone leaves the field alg-confusion attacks
+  // actually target — the signature above is a perfectly good Ed25519
+  // signature even when the header lies about `alg` [TAP-SIG-ALG].
+  if (header.alg !== "EdDSA") throw new Error(`unsupported alg in JOSE header: ${header.alg}`);
   if (header.typ !== PASSPORT_TYP) throw new Error("wrong token type");
   if (header.kid !== jwk.kid) throw new Error("kid mismatch");
   checkNotRevoked(jwk, claims.iat as number);
   // Freshness with the +/-60 s skew allowance, written as the spec's inequality so
   // the two cannot drift apart [TAP-PASSPORT-VALIDATE].
   if (!((claims.iat as number) - 60 <= now && now < (claims.exp as number) + 60))
-    throw new Error("passport expired / not yet valid");
+    throw new PassportExpired(
+      `passport expired / not yet valid: iat=${claims.iat} exp=${claims.exp} now=${now}`,
+    );
   return claims;
 }
 

@@ -19,6 +19,7 @@ import {
   verifyPassport,
   type Jwk,
 } from "./tap.js";
+import { authorityEffectLabel, type AuthorityEffect } from "./authority.js";
 
 /**
  * kid -> public JWK, or null when the key is unknown.
@@ -39,6 +40,8 @@ export interface EventEvaluation {
   integrity: { seq_gap?: number[]; seq_duplicate?: number };
   policy_decision: Record<string, unknown> | null;
   denied: boolean;
+  authorization: Record<string, unknown> | null;
+  authority_effect: AuthorityEffect | null;
 }
 
 type Ev = Record<string, any>;
@@ -83,6 +86,8 @@ export async function evaluateEvent(
       integrity: {},
       policy_decision: null,
       denied: false,
+      authorization: null,
+      authority_effect: null,
     };
   }
 
@@ -112,6 +117,17 @@ export async function evaluateEvent(
   }
 
   const pd = sigValid ? ((event.policy_decision as Record<string, unknown>) ?? null) : null;
+
+  // Authority binding [TAP-EVT-AUTHORIZATION, §9.2, PROVISIONAL]. Labeled
+  // ALONGSIDE policy_decision and two-sided assurance, never in place of
+  // either. Revocation and single-use are NOT checked here: they are
+  // stateful and unimplemented in this reference Verifier (§9.2).
+  const authorization = sigValid ? ((event.authorization as Record<string, unknown>) ?? null) : null;
+  const authorityEffect =
+    authorization != null
+      ? authorityEffectLabel(authorization as any, (event.result as any) ?? {})
+      : null;
+
   return {
     event_id: event.event_id,
     sig_valid: sigValid,
@@ -120,6 +136,8 @@ export async function evaluateEvent(
     integrity,
     policy_decision: pd,
     denied: Boolean(pd && pd.decision === "deny"),
+    authorization,
+    authority_effect: authorityEffect,
   };
 }
 

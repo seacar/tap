@@ -140,6 +140,27 @@ class UnknownSuite(ValueError):
     """
 
 
+class InvalidRecord(ValueError):
+    """A record failed a structural or freshness check during verification.
+
+    A distinct type from a bare ``AssertionError`` for two reasons: `python -O`
+    strips `assert` statements, so a verifier whose typ/kid/alg/freshness checks
+    are assertions accepts a forged token under any production image that sets
+    the flag; and a caller catching verification failures should not also be
+    catching arbitrary `AssertionError`s raised by unrelated bugs elsewhere in
+    the process.
+    """
+
+
+class PassportExpired(InvalidRecord):
+    """A Passport's freshness window [TAP-PASSPORT-VALIDATE] excludes `now`.
+
+    A distinct type from InvalidRecord's other structural failures (wrong typ,
+    mismatched kid, forged alg) so a caller can tell "this passport aged out" —
+    an expected, common outcome — from "this token is malformed or fraudulent".
+    """
+
+
 # v0.1 recognizes only Ed25519.
 _SUITES = {("EdDSA", "Ed25519"): "tap-ed25519"}
 
@@ -213,12 +234,22 @@ def verify_passport(jwk: dict, token: str, now: int | None = None) -> dict:
     pk.verify(b64u_dec(s_b64), f"{h_b64}.{p_b64}".encode("ascii"))
     header = json.loads(b64u_dec(h_b64))
     claims = json.loads(b64u_dec(p_b64))
-    assert header["typ"] == PASSPORT_TYP, "wrong token type"
-    assert header["kid"] == jwk["kid"], "kid mismatch"
+    # §3.1: checking the JWK's suite alone leaves the field alg-confusion attacks
+    # actually target — the signature above is a perfectly good Ed25519
+    # signature even when the header lies about `alg` [TAP-SIG-ALG].
+    if header.get("alg") != "EdDSA":
+        raise InvalidRecord(f"unsupported alg in JOSE header: {header.get('alg')!r}")
+    if header.get("typ") != PASSPORT_TYP:
+        raise InvalidRecord(f"wrong token type: {header.get('typ')!r}")
+    if header.get("kid") != jwk["kid"]:
+        raise InvalidRecord(f"kid mismatch: header={header.get('kid')!r} jwk={jwk['kid']!r}")
     check_not_revoked(jwk, claims.get("iat"))
     # Freshness with the +/-60 s skew allowance, written as the spec's inequality
     # so the two cannot drift apart [TAP-PASSPORT-VALIDATE].
-    assert claims["iat"] - 60 <= now < claims["exp"] + 60, "passport expired / not yet valid"
+    if not (claims["iat"] - 60 <= now < claims["exp"] + 60):
+        raise PassportExpired(
+            f"passport expired / not yet valid: iat={claims['iat']} exp={claims['exp']} now={now}"
+        )
     return claims
 
 
@@ -246,7 +277,8 @@ def verify_event(jwk: dict, event: dict) -> bool:
     check_not_revoked(jwk, event.get("ts"))
     pk = Ed25519PublicKey.from_public_bytes(b64u_dec(jwk["x"]))
     pk.verify(b64u_dec(event["sig"]), signing_input(event))
-    assert event["kid"] == jwk["kid"], "kid mismatch"
+    if event["kid"] != jwk["kid"]:
+        raise InvalidRecord(f"kid mismatch: event={event['kid']!r} jwk={jwk['kid']!r}")
     return True
 
 

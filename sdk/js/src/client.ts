@@ -416,6 +416,7 @@ export class TAPClient {
     error?: string | null;
     actionRef?: string;
     passport?: Passport;
+    latencyMs?: number | null;
   }): Promise<Record<string, unknown>> {
     return this.emit({
       kind: "tool_call",
@@ -428,6 +429,7 @@ export class TAPClient {
       error: args.error ?? null,
       passport: args.passport,
       actionRef: args.actionRef,
+      latencyMs: args.latencyMs,
     });
   }
 
