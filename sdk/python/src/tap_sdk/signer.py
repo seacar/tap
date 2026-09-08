@@ -486,9 +486,7 @@ class TAPClient:
         # keeps the canonical form deterministic. `null` and absent are different
         # signed bytes, so two Signers that disagree here produce structurally
         # different events for logically identical actions.
-        result: dict[str, Any] = {"status": status, "code": code, "error": error}
-        if latency_ms is not None:
-            result["latency_ms"] = latency_ms
+        result: dict[str, Any] = {"status": status, "code": code, "latency_ms": latency_ms, "error": error}
         if effect_digest is not None:
             # [TAP-AUTHORITY-EFFECT, §9.2, provisional] — omit when unmeasured,
             # never null, matching every other optional field's omit discipline.
@@ -696,7 +694,7 @@ class TAPClient:
                 "event_id_root": root,
                 "count": count,
             },
-            "result": {"status": "success", "code": "OK", "error": None},
+            "result": {"status": "success", "code": "OK", "latency_ms": None, "error": None},
             "attestor": "agent",
             "kid": self.kid,
         }
@@ -720,7 +718,7 @@ class TAPClient:
             p,
             kind="model_response",
             intent=intent,
-            tool="agent.record",
+            tool="agent.run",
             scope_used=scope_used,
             reasoning=reasoning,
             model_output=text,

@@ -850,9 +850,6 @@ func VerifyPassport(jwk map[string]any, token string, now int64) (map[string]any
 		return nil, err
 	}
 
-	if header["alg"] != "EdDSA" {
-		return nil, fmt.Errorf("unsupported alg in JOSE header: %v", header["alg"])
-	}
 	if header["typ"] != PassportTyp {
 		return nil, errors.New("wrong token type")
 	}

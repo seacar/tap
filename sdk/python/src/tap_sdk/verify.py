@@ -15,7 +15,6 @@ from typing import Any, Callable
 from .display import hydrate_record
 
 from .core import (
-    PassportExpired,
     RevokedKey,
     checkpoint_root,
     key_revoked_at,
@@ -145,8 +144,9 @@ def check_passport(
             return {"valid": False, "expired": False, "reason": "unknown kid", "claims": None}
         claims = verify_passport(jwk, compact_jwt, now=now)
         return {"valid": True, "expired": False, "claims": claims}
-    except PassportExpired as exc:
-        return {"valid": False, "expired": True, "reason": str(exc), "claims": None}
+    except AssertionError as exc:
+        expired = "expired" in str(exc)
+        return {"valid": False, "expired": expired, "reason": str(exc), "claims": None}
     except Exception as exc:
         return {"valid": False, "expired": False, "reason": str(exc), "claims": None}
 

@@ -32,7 +32,6 @@ from .core import digest, json_digest, new_id
 __all__ = [
     "AuthorityError",
     "AuthorityExpired",
-    "AuthorityMalformed",
     "Authorization",
     "authority_state_version",
     "check_authority_window",
@@ -42,18 +41,6 @@ __all__ = [
 
 class AuthorityError(ValueError):
     """Base class for authority-binding errors."""
-
-
-class AuthorityMalformed(AuthorityError):
-    """The authorization block is present but is not a usable approval.
-
-    Raised only by the *enforcement* path (:func:`check_authority_window`),
-    which is reached with attacker-supplied input from the unsigned
-    ``X-TAP-Authorization`` header / ``_meta.tap.authorization`` (§11.1) and
-    must fail closed. The *labeling* path (:func:`authority_effect_label`)
-    never raises — a verifier reading records it did not choose must not let
-    one poisoned block end the whole report.
-    """
 
 
 class AuthorityExpired(AuthorityError):
@@ -145,17 +132,10 @@ def check_authority_window(authorization: Authorization | dict, *, now: int) -> 
         nbf - 60 <= now < exp + 60
 
     the same inequality and skew allowance as Passport freshness
-    [TAP-PASSPORT-VALIDATE]. Raises :class:`AuthorityExpired` outside it, and
-    :class:`AuthorityMalformed` when the block is not a usable approval at all
-    — this is an enforcement point reached with untrusted input, so a
-    malformed block fails closed rather than raising an opaque KeyError/TypeError.
+    [TAP-PASSPORT-VALIDATE]. Raises :class:`AuthorityExpired` outside it.
     """
-    try:
-        rec = authorization if isinstance(authorization, Authorization) else Authorization.from_record(authorization)
-        in_window = rec.nbf - 60 <= now < rec.exp + 60
-    except (KeyError, TypeError) as exc:
-        raise AuthorityMalformed(f"authorization block is not a usable approval: {exc}") from exc
-    if not in_window:
+    rec = authorization if isinstance(authorization, Authorization) else Authorization.from_record(authorization)
+    if not (rec.nbf - 60 <= now < rec.exp + 60):
         raise AuthorityExpired(rec, now=now)
 
 
@@ -175,19 +155,8 @@ def authority_effect_label(authorization: Authorization | dict | None, result: d
     """
     if authorization is None:
         return None
-    # `authorization` arrives from a signed body, and a valid signature says
-    # nothing about a block's SHAPE — a hostile or buggy Signer can sign
-    # `"authorization": {}` or `"authorization": "hello"` just as validly. A
-    # verifier that raises on those is one poisoned event away from taking
-    # down the whole report, so this labels rather than propagates.
-    if isinstance(authorization, Authorization):
-        target = authorization.target_state_digest
-    elif isinstance(authorization, dict):
-        target = authorization.get("target_state_digest")
-    else:
-        return "malformed_authority"
-    if not isinstance(target, str):
-        return "malformed_authority"
+    target = (authorization.target_state_digest if isinstance(authorization, Authorization)
+              else authorization["target_state_digest"])
     effect = result.get("effect_digest")
     if effect is None:
         return "unverified_authority"
