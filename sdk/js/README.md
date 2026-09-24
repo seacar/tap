@@ -57,6 +57,19 @@ await tap.decision({
 
 The full option set is inside the signature, so the agent can't later claim it weighed a different one. **Scores must be strings** — fractional numbers are forbidden in a signed body (spec §3.4), because float canonicalization is the most common cause of cross-language signature divergence.
 
+### Typed decisions (v0.1.7, provisional)
+
+```ts
+const ev = await tap.typedDecision({
+  question: "Route this invoice?", labels: ["auto_approve", "manual_review"],
+  chosen: "auto_approve", score: "0.72", threshold: "0.90", fallbackTo: "llm",
+  decider: { kind: "model", id: "example.com/typed-decider", version: "2026-09-15",
+             outputSchema: ROUTE_SCHEMA, scoreSemantics: "calibrated_probability" },
+});
+```
+
+Records which model, rule, or human decided and whether it cleared its confidence gate. See [docs/typed-decisions.md](../../docs/typed-decisions.md).
+
 ## Attest the server side
 
 ```ts

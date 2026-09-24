@@ -16,6 +16,7 @@
       "description": "Plaintext for a decision Event: the question, and the rationale or reason behind each option.",
       "properties": {
         "question": { "type": "string" },
+        "output_schema": { "description": "Plaintext of the decider's typed output schema; re-hashes to decision.decider.output_schema_digest via SHA-256 over JCS-canonical bytes [TAP-EVT-DECIDER]." },
         "options": {
           "type": "array",
           "items": {

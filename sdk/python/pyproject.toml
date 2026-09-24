@@ -1,6 +1,6 @@
 [project]
 name = "traceable-agent-protocol"
-version = "0.1.6"
+version = "0.1.7"
 description = "Traceable Agent Protocol (TAP) SDK — sign and verify agent provenance (passports, events, decisions)."
 readme = "README.md"
 requires-python = ">=3.10"

@@ -69,6 +69,9 @@ jobs:
       - name: Authority binding (§9.2)
         working-directory: sdk/python
         run: PYTHONPATH=src python3 tests/test_authority.py
+      - name: Typed decisions (§6.4.1, provisional)
+        working-directory: sdk/python
+        run: PYTHONPATH=src python3 tests/test_typed_decisions.py
       - name: Regressions (defects that shipped once)
         working-directory: sdk/python
         run: PYTHONPATH=src python3 tests/test_regressions.py

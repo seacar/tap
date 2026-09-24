@@ -122,7 +122,43 @@
             "additionalProperties": true
           }
         },
-        "options_digest": { "$ref": "#/$defs/digest" }
+        "options_digest": { "$ref": "#/$defs/digest" },
+        "decider": { "$ref": "#/$defs/deciderBlock" },
+        "gate": { "$ref": "#/$defs/gateBlock" }
+      },
+      "additionalProperties": true
+    },
+    "gateDecimal": {
+      "type": "string",
+      "pattern": "^(?:0(?:\\.[0-9]{1,6})?|1(?:\\.0{1,6})?)$",
+      "description": "A decimal in [0, 1] with at most six fractional digits [TAP-EVT-GATE-DECIMAL]. Compared exactly as a decimal, never through binary floating point: \"0.9\" equals \"0.90\"."
+    },
+    "deciderBlock": {
+      "type": "object",
+      "description": "OPTIONAL, PROVISIONAL (v0.1.7) [TAP-EVT-DECIDER]: the component that made this decision (a model, a rule, or a human) when it is not simply the agent's own reasoning. Omitted, never null, when absent.",
+      "required": ["kind", "id"],
+      "properties": {
+        "kind": { "type": "string", "enum": ["model", "rule", "human"] },
+        "id": { "type": "string", "minLength": 1, "description": "Provider-scoped identifier of the decider (a model id, a rule id). A literal string in the signed body: it MUST NOT carry personal data." },
+        "version": { "type": "string", "minLength": 1, "description": "The decider's version as its provider reports it. REQUIRED for kind model and rule." },
+        "version_digest": { "$ref": "#/$defs/digest", "description": "OPTIONAL digest of a pinned artifact (weights, compiled rule) when the operator can produce one." },
+        "output_schema_digest": { "$ref": "#/$defs/digest", "description": "sha256(JCS(output schema)): the typed contract the decider was constrained to. REQUIRED for kind model. Plaintext travels in annex decision.output_schema." },
+        "score_semantics": { "type": "string", "enum": ["calibrated_probability", "probability", "uncalibrated"], "description": "How to read option scores. REQUIRED when any option carries a score." }
+      },
+      "allOf": [
+        { "if": { "properties": { "kind": { "const": "model" } } }, "then": { "required": ["version", "output_schema_digest"] } },
+        { "if": { "properties": { "kind": { "const": "rule" } } }, "then": { "required": ["version"] } }
+      ],
+      "additionalProperties": true
+    },
+    "gateBlock": {
+      "type": "object",
+      "description": "OPTIONAL, PROVISIONAL (v0.1.7) [TAP-EVT-GATE]: the confidence gate this decision was held to. outcome MUST be \"accept\" iff the chosen option's score >= threshold, compared as exact decimals. On \"fallback\", `chosen` is what the decider proposed, not what was enacted; the superseding decision names this Event as its parent_event_id.",
+      "required": ["threshold", "outcome"],
+      "properties": {
+        "threshold": { "$ref": "#/$defs/gateDecimal" },
+        "outcome": { "type": "string", "enum": ["accept", "fallback"] },
+        "fallback_to": { "type": "string", "minLength": 1, "description": "Where a fallback was routed: llm | human | agent | x-<name>. SHOULD be present when outcome is fallback." }
       },
       "additionalProperties": true
     },

@@ -27,7 +27,8 @@ ANNEX_SCHEMA = json.loads((ROOT / "schemas/annex.schema.json").read_text(encodin
 SUITES = json.loads((ROOT / "registries/suites.json").read_text(encoding="utf-8"))
 CODES = json.loads((ROOT / "registries/result-codes.json").read_text(encoding="utf-8"))
 
-SIGNED_CASES = ("event", "decision", "checkpoint", "canonicalization", "authorization")
+SIGNED_CASES = ("event", "decision", "checkpoint", "canonicalization", "authorization",
+                "typed_decision", "typed_decision_fallback", "typed_decision_resolution")
 
 
 def main() -> int:

@@ -33,6 +33,9 @@ CASES = {
     "checkpoint": "checkpoint",
     "canonicalization": "canonicalization",
     "authorization": "authorization",
+    "typed_decision": "typed_decision",
+    "typed_decision_fallback": "typed_decision_fallback",
+    "typed_decision_resolution": "typed_decision_resolution",
 }
 
 

@@ -134,7 +134,7 @@ See [Getting started](docs/getting-started.md) before using TAP in production.
 
 TAP defines three implementation classes — **Signer**, **Verifier**, and **TAP-aware Server / Gateway**. Claims are made per class and protocol version. Passing the positive vectors alone is not enough; a verifier must also reject or flag every applicable negative case.
 
-Specification §14 requires this matrix to be published here and kept honest. Coverage of the implementations in this repository, against TAP v0.1.5:
+Specification §14 requires this matrix to be published here and kept honest. Coverage of the implementations in this repository, against TAP v0.1.7:
 
 | | Python | TypeScript | Go | `tap_ref.py` |
 | --- | --- | --- | --- | --- |
@@ -150,6 +150,7 @@ Read "partial" precisely — the gaps are named, not rounded away:
 - **Go is Signer + verification primitives.** It signs and verifies Passports and Events, reproduces every vector including the canonicalization torture case, and implements the key hierarchy and §9.2's stateless half. It has no client wrapper, no checkpoint reconciliation, no assurance labeling, no chain join, and no server leg.
 - **`[TAP-ASSURANCE-KEY]`'s trust anchor is optional in practice.** All Verifiers apply the structural floor (a `server` leg may not share the agent's `kid`). Supplying the set of recognized server keys is the caller's job; without it, "independently attested" is weaker than §7 describes.
 - **§9.2 authority binding is provisional** and outside §14's table for every class — see Project status below.
+- **§6.4.1 typed decisions are provisional** and outside §14's table: all three SDKs and `tap_ref.py` sign, reproduce, and label them, but no production Signer emits them yet.
 
 Run the full local suite:
 
@@ -169,13 +170,15 @@ Read [SECURITY.md](SECURITY.md) before deployment and use its private reporting 
 
 ## Project status
 
-Current protocol release: **v0.1.5**.
+Current protocol release: **v0.1.7**.
 
 The specification, reference implementation, test vectors, Python, TypeScript, and Go SDKs, Gateway, and Inspector are available. Breaking changes remain possible before v1.0.0. See [CHANGELOG.md](CHANGELOG.md) for signed-byte changes and migration notes.
 
 TAP currently has a single implementer and no external adopters — everything above is validated against itself (three SDKs cross-checked against one reference implementation and one author), not against an independent third party. Treat this as pre-adoption software: expect rough edges, and expect the protocol to firm up as real usage finds them.
 
 v0.1.5 is what that looks like in practice. A review found defects that every one of the 22 checks in `ci-local.sh` passed over, because the checks tested the wrong things: a Signer could forge `two-sided` assurance with its own key (§7's central claim); the Gateway rejected every action after the first under one Passport, making it unusable for any agent that calls more than one tool; the Python Verifier's Passport checks were `assert` statements, which `python -O` strips; a signature-valid Event with a malformed `authorization` crashed the Verifier; and `flush()` spun forever against an unreachable Verifier. The specification and the SDKs also disagreed with each other in five places, including a `latency_ms` null-vs-omitted split that made the two SDKs compose different signed bytes for the same action — the exact failure `[TAP-EVT-OMIT]` exists to prevent, under a CI job named "the two SDKs compose identical envelopes" that never compared them. All are fixed, with regression tests and two new CI checks that reproduce each original defect. See [CHANGELOG.md](CHANGELOG.md).
+
+**Typed decisions (§6.4.1) are provisional** (v0.1.7): a `decision` can name the model, rule, or human that made it (`decider`) and the confidence gate it was held to (`gate`), so an audit can tell a fast typed-model decision from an LLM one and see whether a low-confidence answer was acted on or escalated. Implemented in `tap_ref.py` and all three SDKs, with vectors and one negative case; no signed bytes of any earlier record change. See [docs/typed-decisions.md](docs/typed-decisions.md).
 
 **Authority binding (§9.2) is provisional**: the wire shape and its stateless checks (validity window, effect labeling) are implemented in all three SDKs (Python `tap_sdk.authority`/`TAPClient.authorize()`; TypeScript `authority.ts`/`traceTool({authorize, effectOf})`; Go `GrantAuthorization`/`CheckAuthorityWindow`/`AuthorityEffectLabel`, functions only — Go has no client wrapper yet). The Inspector displays a bound approval's `authz_id`, effect label, and revocation status, read-only.
 

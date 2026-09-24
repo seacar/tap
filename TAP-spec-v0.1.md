@@ -1,6 +1,6 @@
 # Traceable Agent Protocol (TAP) — Specification v0.1
 
-**Status:** Draft · **Version:** 0.1.5 · **Date:** 2026-09-07
+**Status:** Draft · **Version:** 0.1.7 · **Date:** 2026-09-24
 **Steward:** Sworn (https://getsworn.ai) · **License (intended):** Apache-2.0 (spec + reference code)
 **Reference implementation:** `tap_ref.py` · **Conformance vectors:** `test-vectors.json`
 
@@ -17,14 +17,16 @@
 | Version | Example | Changes when |
 |---|---|---|
 | **Wire version** (`v` field, `tap/0.1`) | `tap/0.1` | The envelope changes in a way a conforming Verifier cannot process under the old version. Negotiated per `[TAP-NEGOTIATE]`. |
-| **Document version** | 0.1.5 | Any correction to this specification. |
-| **Package versions** | `traceable-agent-protocol` 0.1.5 | Any release of an SDK. |
+| **Document version** | 0.1.7 | Any correction to this specification. |
+| **Package versions** | `traceable-agent-protocol` 0.1.7 | Any release of an SDK. |
 
 A document patch release does **not** normally change signed bytes. **v0.1.2 is an exception and changes them deliberately:** it corrects places where this document disagreed with its own reference implementation, and where the vectors under-specified the contract. The wire version stays `tap/0.1` because v0.1 has no production deployments to strand. The changed bytes are listed in `CHANGELOG.md`. Any *future* signed-byte change requires a wire-version bump.
 
 **v0.1.3 adds authority binding (§9.2)** — an OPTIONAL `authorization` block and an OPTIONAL `result.effect_digest` field, both omitted per `[TAP-EVT-OMIT]` when unused. Because both are strictly additive and optional, **no v0.1.2 signed record and no existing conformance vector changes.**
 
 **v0.1.5 closes gaps a review found between this document and its own implementations.** No signed bytes change and no vector changes; every addition is a rule that was already assumed, stated normatively because two implementers reading v0.1.4 would have disagreed. `[TAP-ASSURANCE-KEY]` (a `server` leg must not be signed by the agent's key — without it a Signer forges `two-sided` alone, which §7 claims is impossible); `[TAP-ASSURANCE-SEQ]` (agent and server legs keep independent `seq` counters under one `aid`); `[TAP-EVT-CHECKPOINT-LEAVES]` (checkpoint Events consume a `seq` but are never Merkle leaves); `[TAP-REPLAY-EDGE]` and `[TAP-REPLAY-SEQ]` (a Passport is presented on every action of a record, so `jti` uniqueness belongs to the delegation edge only, and `(aid, seq)` needs wire carriage to be enforceable at an action edge); `[TAP-REPLAY-CID]` (an unsigned `_meta` hint may not redirect a chain); plus §3.1/§5.3 on validating the JOSE header's `alg` and on verifier robustness. See `CHANGELOG.md`.
+
+**v0.1.7 adds typed decisions (§6.4.1, provisional)** — two OPTIONAL blocks inside `decision`: `decider` (which model, rule, or human made the decision, its version, the typed output contract it was held to, and how to read its scores) and `gate` (the confidence threshold the decision was held to and whether it cleared it or fell back). Agents increasingly route narrow decisions — classify, route, extract, approve-or-review — to small, fast, typed decision models rather than to their main LLM, and a v0.1.6 record cannot say which component decided, or whether a low-confidence answer was acted on anyway. Both blocks are strictly additive and omitted per `[TAP-EVT-OMIT]` when unused, so **no earlier signed record and no existing conformance vector changes**; the wire version stays `tap/0.1`. `test-vectors.json` gains `typed_decision`, `typed_decision_fallback`, `typed_decision_resolution`, a `decision_gate` fixture table, and one `negative` case (`gate_outcome_inconsistent`).
 
 **v0.1.4 gives §9.2 a reference implementation for its stateless half.** `tap_ref.py` now signs/verifies an Event carrying `authorization`, and implements `check_authority_window` (`[TAP-AUTHORITY-VALIDITY]`) and `authority_effect_label` (`[TAP-AUTHORITY-EFFECT]`) as pure functions — mirroring how checkpoint reconciliation is a pure function rather than a stateful service. `test-vectors.json` gained an `authorization` case (existing cases are byte-for-byte unchanged; nothing about them was touched). `[TAP-AUTHORITY-REVOKE]` and `[TAP-AUTHORITY-REUSE]` are **still unimplemented everywhere** — they require a stateful registry, which is a Verifier/Service-Profile concern this file does not have. No production Signer, Verifier, or SDK implements any part of §9.2 yet; §9.2 remains provisional and none of its MUSTs are in §14's Conformance table until that changes. See `CHANGELOG.md` for both entries.
 
@@ -361,6 +363,14 @@ A small number of fields are **explicitly nullable** — `null` is a meaningful 
 | `evidence` | `reasoning_digest`, `model_output_digest`, `nego` | OPTIONAL — omit when absent |
 | `checkpoint` | `from_seq`, `through_seq`, `event_id_root`, `count` | REQUIRED when `checkpoint` is present |
 | `authorization` | `authz_id`, `authority_state_version`, `target_state_digest`, `nbf`, `exp`, `issuer_kid` | REQUIRED when `authorization` is present (§9.2, provisional) |
+| `decision` | `selection`, `decider`, `gate` | OPTIONAL — omit when absent (`decider`, `gate`: §6.4.1, provisional) |
+| `decision.decider` | `kind`, `id` | REQUIRED when `decider` is present |
+| `decision.decider` | `version` | REQUIRED when `kind` is `model` or `rule`; otherwise OPTIONAL — omit when absent |
+| `decision.decider` | `output_schema_digest` | REQUIRED when `kind` is `model`; otherwise OPTIONAL — omit when absent |
+| `decision.decider` | `score_semantics` | REQUIRED when any option carries a `score`; otherwise omit |
+| `decision.decider` | `version_digest` | OPTIONAL — omit when absent |
+| `decision.gate` | `threshold`, `outcome` | REQUIRED when `gate` is present |
+| `decision.gate` | `fallback_to` | OPTIONAL — omit when absent; SHOULD be present when `outcome` is `fallback` |
 
 A Verifier **MUST NOT** reject an Event solely for carrying an explicit null where this table says omit — the signature is still valid and the record is still evidence — but **MUST** be able to surface it as a conformance defect, because it is one.
 
@@ -461,6 +471,64 @@ Rules:
 - To raise assurance from commitment to cognition, the option set **SHOULD** be reflected in `evidence.model_output_digest` so the recorded counterfactual is bound to the actual model output.
 - A `decision` MAY precede the `tool_call`/`agent_delegate` that enacts the chosen option, correlated by `cid` and OPTIONALLY `action_ref`.
 
+#### 6.4.1 Typed Decisions — Decider Provenance and Confidence Gates (provisional) · `[TAP-EVT-DECIDER]` `[TAP-EVT-GATE]`
+
+> **Status: provisional (v0.1.7).** The schema, the gate-consistency label, and the decimal comparison rule have a reference implementation in `tap_ref.py` and in the Python, TypeScript, and Go SDKs, with fixed vectors (`typed_decision`, `typed_decision_fallback`, `typed_decision_resolution`, `decision_gate`) and one negative case (`gate_outcome_inconsistent`). No production Signer emits them yet. None of this subsection's rules are in §14's Conformance table until one does, and until then a `gate_inconsistent` label is reported but does not by itself make a transcript unverified.
+
+A §6.4 decision records *what* was chosen and *what else* was considered. It does not record *who* chose. That was adequate while an agent's decisions were all made by its own model, whose identity the Passport already carries (`meta.model`, §5.2). It is no longer adequate: agents route narrow decisions — classify, route, extract, approve-or-review — to separate components chosen for speed and cost: small typed decision models that return one label from a fixed set with a calibrated probability, compiled rules, and human reviewers. A relying party auditing such a decision needs to know which component made it, under what output contract, and whether a low-confidence answer was acted on or escalated. `decider` and `gate` carry those facts inside the signing input, so they cannot be revised after the fact.
+
+**`decision.decider`** · `[TAP-EVT-DECIDER]` — OPTIONAL. Present when the decision was made by a component other than the agent's own reasoning:
+
+```jsonc
+"decider": {
+  "kind": "model",                         // model | rule | human (MUST)
+  "id": "example.com/typed-decider",       // provider-scoped identifier (MUST)
+  "version": "2026-09-15",                 // version as the provider reports it (MUST for model, rule)
+  "version_digest": "sha256:…",            // pinned weights / compiled rule, when producible (OPTIONAL)
+  "output_schema_digest": "sha256:…",      // sha256(JCS(output schema)) — the typed contract (MUST for model)
+  "score_semantics": "calibrated_probability"  // calibrated_probability | probability | uncalibrated
+                                              // (MUST when any option carries a score)
+}
+```
+
+Rules:
+- `id` and `version` are literal strings in the signed body. They identify a component, not a person, and **MUST NOT** carry personal data. For `kind: "human"`, `id` **SHOULD** name a role or queue (`"reviewer:ap-team"`), never an individual; attribution to a person belongs in the annex or in a Service Profile.
+- `output_schema_digest` is `sha256(JCS(schema))` — the same construction as `args_digest` and `policy_version` (§9.1). The plaintext schema travels in the annex as `decision.output_schema` and, while the annex exists, **MUST** re-hash to the digest (`[TAP-EVT-ANNEX]`). A Verifier holding the annex **SHOULD** check that every option `id` is a value the schema permits.
+- The decider's input **SHOULD** be committed by `action.args_digest`, with the plaintext in the annex's `args`, exactly as for a `tool_call`. No new field is introduced for it.
+- `score_semantics` tells a relying party how to read option `score`s. `calibrated_probability` asserts that the decider's scores were calibrated against observed accuracy; it is the Signer's claim, not something a Verifier can check from one record. A `probability` is a normalized score with no calibration claim; `uncalibrated` scores are rankings only.
+- `decider` is orthogonal to the Passport's `meta.model`: the Passport names the agent's primary model once per record, `decider` names the component behind one decision. They routinely differ.
+
+**`decision.gate`** · `[TAP-EVT-GATE]` — OPTIONAL. Present when the decision was held to a confidence threshold before it could be enacted:
+
+```jsonc
+"gate": {
+  "threshold": "0.90",       // gate decimal (MUST)
+  "outcome": "fallback",     // accept | fallback (MUST)
+  "fallback_to": "llm"       // llm | human | agent | x-<name> (SHOULD when outcome is fallback)
+}
+```
+
+Rules:
+- A `gate` **MUST** be accompanied by a `decider` whose `score_semantics` is `calibrated_probability` or `probability`, and the chosen option **MUST** carry a `score`. A gate over rankings is meaningless.
+- `outcome` **MUST** be `"accept"` if and only if the chosen option's `score` is greater than or equal to `threshold`, and `"fallback"` otherwise.
+- **Gate decimals** · `[TAP-EVT-GATE-DECIMAL]`. A gated `score` and a `threshold` **MUST** match `^(0(\.[0-9]{1,6})?|1(\.0{1,6})?)$` — a decimal in [0, 1] with at most six fractional digits — and **MUST** be compared exactly as decimals, never through binary floating point. `"0.9"` and `"0.90"` are equal, and a score exactly on the threshold is `accept`. The reference implementation compares integer millionths. Without this rule two conforming Verifiers can disagree about a score that sits on the threshold, which is exactly where the disagreement matters.
+- On `"fallback"`, the gated Event's `chosen` records what the decider **proposed**, not what was enacted. The decision that supersedes it — made by a different decider, or by a human — is a later `decision` Event whose `parent_event_id` is the gated Event's `event_id`, and which **SHOULD** share its `action_ref`. The enacting action follows the superseding decision, not the gated one.
+- An action enacted on a proposal that fell back, with no superseding decision, is the failure this block exists to make visible.
+
+**Verification.** A Verifier evaluating a sig-valid `decision` Event that carries a `gate` **MUST** be able to label it:
+
+| Label | Condition |
+|---|---|
+| `gate_consistent` | the signed `outcome` is the one the signed score and threshold imply |
+| `gate_inconsistent` | they disagree — e.g. `accept` for a score below the threshold. The record contradicts itself: a buggy or dishonest Signer |
+| `gate_unscorable` | the gate cannot be evaluated: no `decider`, non-probability `score_semantics`, no score on the chosen option, or a malformed decimal |
+
+Across a delivered batch, a `fallback`-gated decision with no superseding `decision` naming it as `parent_event_id` **SHOULD** be reported as `gate_unresolved`. Like an uncovered sequence gap (§6.3) this is informational — the superseding decision may simply not have arrived yet — until a checkpoint seals the interval without it.
+
+These labels are reported **alongside** signature validity, assurance (§7), and authority binding (§9.2), never in place of them. A `gate_consistent` label says the record agrees with itself; it does not say the decider was right, or that its probabilities were in fact calibrated.
+
+> **Non-normative example.** A "System One" typed decision model (one label from a fixed enum, a calibrated probability, sub-second latency) routes invoices with a 0.90 gate. A 0.97 `auto_approve` is recorded with `outcome: "accept"` and enacted. A 0.72 `auto_approve` is recorded with `outcome: "fallback"`, `fallback_to: "llm"`; a frontier model, held to the same output schema, then decides `manual_review` in a new `decision` Event whose `parent_event_id` names the gated one. All three are in `test-vectors.json`.
+
 ### 6.5 Signing & Verification · `[TAP-EVT-VERIFY]`
 
 **Sign:** reject the body if it violates `[TAP-CANON-NUMBERS]` → remove `sig` if present → `JCS(body)` → Ed25519 sign → set `sig = base64url(signature)`. `kid` is part of the signed body.
@@ -485,6 +553,9 @@ The reference vectors exercise the digest-only envelope, the `decision` fraction
 | `checkpoint` Event | `checkpoint.*` | `a2ff927d9d8672181ebc3a4c3f27a0300a63882adec1933ad8a67de4a224cd1b` | `HHLRpqv-XfnQI2bPVe5w43wBg-PSW0gBjYFb1g8-Vfl764o8rIDlIDSH9iX7zgQZR3oBxzAWReGAjHrbx1-9Cw` |
 | Canonicalization torture Event | `canonicalization.*` | `7dde8b904e75b21e37fe2b9d5fb7b4afa8791043d48c87b70306aae814fe86d5` | `1svaMKeqjt1dA97HtzgNTL841i_07uuR7-83kRuSsz8xqkMRuu-hpLRpMIbUEzwUCBOMG12rD1Pwq-VOaty5CA` |
 | Authorization Event (§9.2, provisional) | `authorization.*` | `82709ab82b7312027cc7eb02fd555ca04d5116ad1ceecc031893f4198a7191f5` | `Tqa8npG4sy9yOVhJhfIcPw4ZWfvbBW3otja5UrWzD6QkjQMUE5fzFV1G3lWcELk40gSxy_1EAViVvBbAOBv4DQ` |
+| Typed decision, gate accepted (§6.4.1, provisional) | `typed_decision.*` | `fa50a4aee8c946b54fa93c08ea0f6a9b327a4d17279b2b436a207e801f6a3991` | `rZTVnNpQKNVeBDS7ExSRa2DBxhKrTU7o0_w7x3QFTXQYfjNiCOy1Xd3WxmuVV0V0fQKZnEQM6xYiFxTTIIXCAQ` |
+| Typed decision, gate fell back (§6.4.1, provisional) | `typed_decision_fallback.*` | `0bf85a8c325cb70ee9dd74f421993897481110a4769239907e58b130d399e406` | `pi6xf_yYHsutLS5P5TAQlIcs2PNTuxAKglFJdjTu4_eY-LjBkIoBTAxMkTN1u40BJJ3kuTiN4yAbb23k3T7RDw` |
+| Superseding decision (§6.4.1, provisional) | `typed_decision_resolution.*` | `5b91a3569928c9c5bc7467b61a057a8f5d657f18de2b5bf7209562a740ab1c16` | `FWmG5aFbWXejUiwsHCOfPQzg6mUkEwd5mkJNUaSt-JePleAp8whlV7-HCt6gS7G2s8CcGBm7E62qZ3wDqBD9CA` |
 
 Each row's paths are `<case>.canonical_signing_input_sha256` and `<case>.signed_event.sig`.
 
@@ -709,6 +780,7 @@ TAP records provenance; it does **not** provide confidentiality. Transport **SHO
 - **Downgrade / missing Passport.** An action without a valid Passport is *unattested*; Servers **MUST** treat it as such. Negotiated downgrade to `intent-only` **MUST** be labeled; the `nego` binding in §4.1 makes a forced downgrade detectable.
 - **Canonicalization attacks.** Strict RFC 8785 + the no-fractional-numbers rule (§3.4) + algorithm pinning prevent signature-evasion via JSON ambiguity.
 - **Post-quantum.** EdDSA offers no quantum resistance. TAP's answer is suite agility (§3.6), composite signatures, and timestamp anchoring of checkpoint roots to an RFC 3161 authority.
+- **Decider claims.** `decision.decider` and `decision.gate` (§6.4.1) are the Signer's own statements. A compromised Signer can name the wrong decider or claim calibration it does not have; what it cannot do is record a gate that contradicts its own signed score without that being detectable (`gate_inconsistent`), or revise either after signing. Where the decider is a hosted model, a server-attested leg from the provider (§7) is the path to independent evidence of which model answered.
 - **Scope of guarantees.** TAP proves *what an agent did and who signed for it*. It does not prove the *truthfulness* of stated reasoning, nor stop a fully compromised Signer from signing false intent — which is precisely why independent server attestation (§7) materially raises assurance.
 
 ---
@@ -731,6 +803,8 @@ Reproduction alone is a weak contract: it establishes that an implementation can
 A conforming Verifier **MUST** implement suite-driven verification (`[TAP-SUITE-DISPATCH]`) so that future suites require no verifier rewrite, and **MUST** reject any suite it does not recognize rather than fall back to a default.
 
 **Per-implementation coverage.** Conformance is claimed per class, and the SDKs in this repository do not all cover all three. The current matrix is published in `README.md` under "Conformance" and **MUST** be kept honest: claiming a class an implementation does not fully cover is the failure mode this whole document exists to prevent. For four releases this paragraph pointed at a matrix that did not exist, which is the same failure in a quieter form.
+
+**Typed decisions (§6.4.1) are provisional and out of scope for this table.** `[TAP-EVT-DECIDER]`, `[TAP-EVT-GATE]`, and `[TAP-EVT-GATE-DECIMAL]` have a reference implementation and vectors, but no production Signer emits them yet. Implementations **SHOULD** pass the typed-decision vectors now; the rules move into the Signer and Verifier rows once a production Signer does.
 
 **Authority binding (§9.2) is provisional and out of scope for this table.** None of `[TAP-EVT-AUTHORIZATION]`, `[TAP-AUTHORITY-VALIDITY]`, `[TAP-AUTHORITY-REUSE]`, `[TAP-AUTHORITY-REVOKE]`, or `[TAP-AUTHORITY-EFFECT]` is a MUST for any class above — no reference implementation or conformance vector exists yet. They move into the Signer/Verifier/Server rows once both do.
 

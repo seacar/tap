@@ -24,6 +24,7 @@ TAP is the Traceable Agent Protocol: an open protocol for producing signed, inde
 - [Architecture and trust model](architecture.md)
 - [Getting started](getting-started.md)
 - [Integration guide](integration-guide.md)
+- [Typed decisions](typed-decisions.md) — which model, rule, or human decided, and confidence gates (v0.1.7, provisional)
 
 ### Implement
 

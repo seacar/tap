@@ -29,6 +29,9 @@ The published vectors exercise:
   * authority binding — validity window and     [TAP-EVT-AUTHORIZATION,
     effect-match labeling (PROVISIONAL: no        TAP-AUTHORITY-VALIDITY,
     Verifier/SDK/Service-Profile enforces it yet)  TAP-AUTHORITY-EFFECT, §9.2]
+  * typed decisions — decider provenance and     [TAP-EVT-DECIDER,
+    confidence gates, incl. a fallback chain      TAP-EVT-GATE, §6.4.1]
+    (PROVISIONAL, v0.1.7)
   * a `negative` section of records a conforming
     verifier MUST reject or flag                 [TAP-CONFORMANCE, §14]
 """
@@ -284,6 +287,66 @@ def authority_effect_label(authorization: dict | None, result: dict) -> str | No
         return "unverified_authority"
     return ("authorized_match" if effect == authorization["target_state_digest"]
             else "authorized_mismatch")
+
+# ---------- typed decisions (§6.4.1, provisional) ----------
+# A decision may name the component that made it (`decision.decider`) and the
+# confidence gate it was held to (`decision.gate`). Both are stateless to check,
+# so — like the authority-binding checks above — they are pure functions here.
+
+import re as _re
+
+# [TAP-EVT-GATE-DECIMAL]: a gated score or threshold is a decimal in [0, 1] with
+# at most six fractional digits. Anything else is unscorable, not "close enough".
+_GATE_DECIMAL = _re.compile(r"^(?:0(?:\.[0-9]{1,6})?|1(?:\.0{1,6})?)$")
+
+def gate_decimal_micros(value) -> int:
+    """Parse a gate decimal string to integer millionths, exactly.
+
+    Comparison MUST be exact decimal comparison, never binary floating point
+    [TAP-EVT-GATE-DECIMAL]: "0.9" and "0.90" are equal, and no implementation may
+    disagree about a score sitting exactly on the threshold. Raises ValueError on
+    anything outside the grammar (including non-strings)."""
+    if not isinstance(value, str) or not _GATE_DECIMAL.match(value):
+        raise ValueError(f"not a gate decimal in [0, 1] with <= 6 places: {value!r}")
+    whole, _, frac = value.partition(".")
+    return int(whole) * 1_000_000 + int((frac + "000000")[:6])
+
+def gate_outcome(score: str, threshold: str) -> str:
+    """The outcome a gate MUST record [TAP-EVT-GATE]: "accept" iff the chosen
+    option's score is >= the threshold, else "fallback"."""
+    return "accept" if gate_decimal_micros(score) >= gate_decimal_micros(threshold) else "fallback"
+
+GATED_SCORE_SEMANTICS = ("calibrated_probability", "probability")
+
+def decision_gate_label(decision: dict | None) -> str | None:
+    """Label a decision's confidence gate [TAP-EVT-GATE, §6.4.1].
+
+    Returns None when the Event carries no gate (the label does not apply);
+    otherwise one of:
+      "gate_consistent"   — the signed outcome is the one the signed score and
+                            threshold imply;
+      "gate_inconsistent" — they disagree: the record contradicts itself (e.g. it
+                            says "accept" for a score below the threshold);
+      "gate_unscorable"   — the gate cannot be evaluated: no decider, score
+                            semantics that are not a probability, no score on the
+                            chosen option, or a malformed decimal.
+    Reported ALONGSIDE signature validity, never in place of it."""
+    if not isinstance(decision, dict) or "gate" not in decision:
+        return None
+    gate = decision.get("gate") or {}
+    decider = decision.get("decider") or {}
+    if decider.get("score_semantics") not in GATED_SCORE_SEMANTICS:
+        return "gate_unscorable"
+    chosen = [o for o in decision.get("options") or [] if o.get("chosen") is True]
+    if len(chosen) != 1 or chosen[0].get("id") != decision.get("chosen"):
+        return "gate_unscorable"
+    try:
+        expected = gate_outcome(chosen[0].get("score"), gate.get("threshold"))
+    except ValueError:
+        return "gate_unscorable"
+    if gate.get("outcome") not in ("accept", "fallback"):
+        return "gate_unscorable"
+    return "gate_consistent" if gate["outcome"] == expected else "gate_inconsistent"
 
 # ---------- deterministic test-vector generation ----------
 
@@ -567,6 +630,164 @@ if __name__ == "__main__":
         "args_preview": auth_args,
     }
 
+    # ----- typed decisions [TAP-EVT-DECIDER, TAP-EVT-GATE, §6.4.1] (provisional) -----
+    # A fast typed-decision model (a "System One" classifier: unstructured input
+    # in, one label from a fixed set out, with a calibrated probability) routes
+    # invoices. Two decisions: one clears its 0.90 confidence gate and is enacted;
+    # one does not, so it falls back to a frontier LLM, whose superseding decision
+    # names the gated one as its parent. The decider identifiers are neutral
+    # examples on purpose — the contract must not bake in any one vendor.
+    ROUTE_SCHEMA = {
+        "type": "object",
+        "required": ["label", "probability"],
+        "properties": {
+            "label": {"enum": ["auto_approve", "manual_review"]},
+            "probability": {"type": "string"},
+        },
+        "additionalProperties": False,
+    }
+    route_schema_digest = json_digest(ROUTE_SCHEMA)
+    typed_decider = {
+        "kind": "model",
+        "id": "example.com/typed-decider",
+        "version": "2026-09-15",
+        "output_schema_digest": route_schema_digest,
+        "score_semantics": "calibrated_probability",
+    }
+    route_question = "Route this invoice: auto-approve or manual review?"
+
+    def _route_event(event_id, seq, ts, ref, invoice, p_approve, p_review, gate, latency):
+        opts = [
+            {"id": "auto_approve", "score": p_approve, "chosen": True},
+            {"id": "manual_review", "score": p_review, "chosen": False},
+        ]
+        body = {
+            "v": "tap/0.1",
+            "event_id": event_id,
+            "passport_jti": JTI,
+            "aid": AID,
+            "cid": cid,
+            "seq": seq,
+            "ts": ts,
+            "action": {
+                "kind": "decision",
+                "intent_digest": text_digest(route_question),
+                "tool": "invoice_route",
+                "scope_used": None,
+                # the decider's INPUT is committed here; plaintext lives in the annex
+                "args_digest": json_digest(invoice),
+            },
+            "decision": {
+                "question_digest": text_digest(route_question),
+                "chosen": "auto_approve",
+                "selection": "argmax",
+                "options": opts,
+                "options_digest": json_digest(opts),
+                "decider": typed_decider,
+                "gate": gate,
+            },
+            "evidence": {"model_output_digest":
+                         json_digest({"label": "auto_approve", "probability": p_approve})},
+            "result": {"status": "success", "code": "OK", "latency_ms": latency, "error": None},
+            "attestor": "agent",
+            "action_ref": ref,
+            "kid": KID,
+        }
+        annex = {
+            "event_id": event_id,
+            "intent": route_question,
+            "args": invoice,
+            "decision": {"question": route_question, "output_schema": ROUTE_SCHEMA},
+        }
+        return body, annex
+
+    EVT_TD_ACCEPT = "evt_01JABCDEFGHJKMNPQRSTVWXYZ5"
+    invoice_ok = {"invoice": "INV-2291", "vendor": "Acme Marine Supply",
+                  "total_cents": 48200, "po_match": True}
+    td_accept_body, td_accept_annex = _route_event(
+        EVT_TD_ACCEPT, 12, "2026-01-01T00:03:14.210Z", "act_01JABCDEF7777777777777777",
+        invoice_ok, "0.97", "0.03", {"threshold": "0.90", "outcome": "accept"}, 84)
+    td_accept_event = sign_event(sk, td_accept_body)
+
+    EVT_TD_FALLBACK = "evt_01JABCDEFGHJKMNPQRSTVWXYZ6"
+    invoice_odd = {"invoice": "INV-2292", "vendor": "Acme Marine Supply",
+                   "total_cents": 912000, "po_match": False}
+    td_fallback_body, td_fallback_annex = _route_event(
+        EVT_TD_FALLBACK, 13, "2026-01-01T00:03:14.388Z", "act_01JABCDEF8888888888888888",
+        invoice_odd, "0.72", "0.28",
+        {"threshold": "0.90", "outcome": "fallback", "fallback_to": "llm"}, 91)
+    td_fallback_event = sign_event(sk, td_fallback_body)
+
+    # The superseding decision: a frontier LLM, constrained to the SAME output
+    # schema, decides the case the gate refused. It carries no gate and no scores
+    # (so no score_semantics), and names the gated Event as its parent.
+    EVT_TD_RESOLVE = "evt_01JABCDEFGHJKMNPQRSTVWXYZ7"
+    resolve_rationale = "Total is 19x the vendor's median and there is no PO match."
+    resolve_reason = "Auto-approval requires a PO match under AP policy v2."
+    resolve_opts = [
+        {"id": "auto_approve", "chosen": False, "reason_digest": text_digest(resolve_reason)},
+        {"id": "manual_review", "chosen": True, "rationale_digest": text_digest(resolve_rationale)},
+    ]
+    td_resolve_body = {
+        "v": "tap/0.1",
+        "event_id": EVT_TD_RESOLVE,
+        "passport_jti": JTI,
+        "aid": AID,
+        "cid": cid,
+        "seq": 14,
+        "ts": "2026-01-01T00:03:17.902Z",
+        "action": {
+            "kind": "decision",
+            "intent_digest": text_digest(route_question),
+            "tool": "invoice_route",
+            "scope_used": None,
+            "args_digest": json_digest(invoice_odd),
+        },
+        "decision": {
+            "question_digest": text_digest(route_question),
+            "chosen": "manual_review",
+            "options": resolve_opts,
+            "options_digest": json_digest(resolve_opts),
+            "decider": {
+                "kind": "model",
+                "id": "example.com/frontier-llm",
+                "version": "2026-06-01",
+                "output_schema_digest": route_schema_digest,
+            },
+        },
+        "evidence": {"reasoning_digest": text_digest(resolve_rationale),
+                     "model_output_digest": digest(b"<full frontier-model output>")},
+        "result": {"status": "success", "code": "OK", "latency_ms": 3514, "error": None},
+        "attestor": "agent",
+        "action_ref": "act_01JABCDEF8888888888888888",
+        "parent_event_id": EVT_TD_FALLBACK,
+        "kid": KID,
+    }
+    td_resolve_event = sign_event(sk, td_resolve_body)
+    td_resolve_annex = {
+        "event_id": EVT_TD_RESOLVE,
+        "intent": route_question,
+        "args": invoice_odd,
+        "reasoning": resolve_rationale,
+        "decision": {
+            "question": route_question,
+            "output_schema": ROUTE_SCHEMA,
+            "options": [
+                {"id": "auto_approve", "reason": resolve_reason},
+                {"id": "manual_review", "rationale": resolve_rationale},
+            ],
+        },
+    }
+
+    # A self-contradicting gate: the fallback case re-signed claiming "accept"
+    # for a 0.72 score under a 0.90 threshold. The signature is valid; the record
+    # is not consistent with itself, and a Verifier MUST be able to say so.
+    bad_gate_body = {k: v for k, v in td_fallback_event.items() if k != "sig"}
+    bad_gate_body["event_id"] = "evt_01JABCDEFGHJKMNPQRSTVWXYZA"
+    bad_gate_body["decision"] = {**td_fallback_event["decision"],
+                                 "gate": {"threshold": "0.90", "outcome": "accept"}}
+    bad_gate_event = sign_event(sk, bad_gate_body)
+
     # ----- negative cases [TAP-CONFORMANCE, §14] -----
     # Reproduction alone is a weak contract: it proves an implementation can SIGN
     # like the reference, not that it REJECTS what the reference rejects. Most of
@@ -701,13 +922,24 @@ if __name__ == "__main__":
             "delivered_event_ids": sealed_ids,
             "committed_event_ids": [EVT_TOOL],
         },
+        "gate_outcome_inconsistent": {
+            "expect": "flag",
+            "reason": "the signed gate says accept, but the chosen option's signed "
+                      "score is below the signed threshold; the record contradicts "
+                      "itself and MUST be surfaced as gate_inconsistent",
+            "spec": "[TAP-EVT-GATE, §6.4.1]",
+            "jwk": jwk,
+            "event": bad_gate_event,
+            "expected_label": "gate_inconsistent",
+        },
     }
 
     # ----- self-checks -----
     # Everything the vectors assert about themselves is checked here first, so a
     # broken contract fails at generation time rather than in someone else's CI.
     assert verify_passport(jwk, passport, now=1767225601)
-    for ev in (tool_event, dec_event, ckpt_event, canon_event, auth_event):
+    for ev in (tool_event, dec_event, ckpt_event, canon_event, auth_event,
+               td_accept_event, td_fallback_event, td_resolve_event):
         assert verify_event(jwk, ev)
 
     # digests-only: the plaintext is NOT in the signed body [TAP-EVT-ENVELOPE, §6.1]
@@ -721,8 +953,11 @@ if __name__ == "__main__":
     assert json_digest(canon_annex["args_preview"]) == canon_event["action"]["args_digest"]
 
     # absent optionals are OMITTED, never null [TAP-EVT-OMIT, §6.1]
-    for ev in (tool_event, dec_event, ckpt_event, canon_event, auth_event):
+    for ev in (tool_event, dec_event, ckpt_event, canon_event, auth_event,
+               td_accept_event, td_fallback_event, td_resolve_event):
         for absent in ("parent_event_id", "policy_decision"):
+            if absent == "parent_event_id" and ev is td_resolve_event:
+                continue  # the one vector that legitimately carries a parent
             assert absent not in ev, f"{absent} must be omitted when absent, not null"
     # authorization itself is correctly ABSENT on every event that has no bound
     # approval — only auth_event carries it
@@ -774,6 +1009,44 @@ if __name__ == "__main__":
         == "authorized_mismatch"
     assert authority_effect_label(authorization, {}) == "unverified_authority"
 
+    # typed decisions [TAP-EVT-DECIDER, TAP-EVT-GATE, TAP-EVT-GATE-DECIMAL, §6.4.1]
+    assert decision_gate_label(dec_event["decision"]) is None, "ungated decision: label n/a"
+    assert decision_gate_label(td_resolve_event["decision"]) is None
+    assert decision_gate_label(td_accept_event["decision"]) == "gate_consistent"
+    assert decision_gate_label(td_fallback_event["decision"]) == "gate_consistent"
+    assert decision_gate_label(bad_gate_event["decision"]) == "gate_inconsistent"
+    assert "decider" not in dec_event["decision"] and "gate" not in dec_event["decision"], \
+        "decider/gate must be omitted when absent, not null"
+    assert "gate" not in td_resolve_event["decision"]
+    assert "score_semantics" not in td_resolve_event["decision"]["decider"], \
+        "no scores -> no score_semantics"
+    assert td_resolve_event["parent_event_id"] == td_fallback_event["event_id"]
+    assert json_digest(td_accept_annex["decision"]["output_schema"]) == \
+        td_accept_event["decision"]["decider"]["output_schema_digest"]
+    assert json_digest(td_fallback_annex["args"]) == td_fallback_event["action"]["args_digest"]
+    labels = set(ROUTE_SCHEMA["properties"]["label"]["enum"])
+    for ev in (td_accept_event, td_fallback_event, td_resolve_event):
+        assert {o["id"] for o in ev["decision"]["options"]} <= labels
+    GATE_CASES = [
+        # (score, threshold, outcome) — the boundary and the spelling cases are the point
+        ("0.97", "0.90", "accept"),
+        ("0.72", "0.90", "fallback"),
+        ("0.9", "0.90", "accept"),          # equal: "0.9" == "0.90", accept
+        ("0.899999", "0.9", "fallback"),
+        ("1", "1.000000", "accept"),
+        ("0", "0", "accept"),
+    ]
+    for score, thr, want in GATE_CASES:
+        assert gate_outcome(score, thr) == want, (score, thr, want)
+    GATE_MALFORMED = ["0.1234567", "1.5", "-0.1", ".9", "0.", "1e-1", " 0.9", "0,9", "01.0"]
+    for bad in GATE_MALFORMED + [0.9, None]:
+        try:
+            gate_decimal_micros(bad); raise SystemExit(f"FAIL: gate decimal {bad!r} accepted")
+        except ValueError:
+            pass
+    assert decision_gate_label(negative["gate_outcome_inconsistent"]["event"]["decision"]) \
+        == negative["gate_outcome_inconsistent"]["expected_label"]
+
     # every negative case behaves as its `expect` says
     for name, case in negative.items():
         if name.startswith("_"):
@@ -814,7 +1087,7 @@ if __name__ == "__main__":
             "TAP v0.1 conformance vectors. Reproduce byte-for-byte from the seed. "
             "Generated by tap_ref.py — do not hand-edit."
         ),
-        "_spec_version": "0.1.5",
+        "_spec_version": "0.1.7",
         "_wire_version": "tap/0.1",
         "ed25519_private_seed_hex": SEED,
         "jwks": {"keys": [jwk]},
@@ -907,6 +1180,58 @@ if __name__ == "__main__":
                          "unverified_authority",
             },
         },
+        "typed_decision": {
+            "_about": (
+                "Typed decisions (§6.4.1, PROVISIONAL, v0.1.7): a decision that names "
+                "the component that made it (decision.decider) and the confidence "
+                "gate it was held to (decision.gate). This case clears its gate "
+                "and is enacted."
+            ),
+            "canonical_signing_input_sha256":
+                hashlib.sha256(signing_input(td_accept_event)).hexdigest(),
+            "signed_event": td_accept_event,
+            "annex": td_accept_annex,
+            "expected_gate_label": "gate_consistent",
+            "output_schema_construction": {
+                "output_schema": ROUTE_SCHEMA,
+                "output_schema_digest": route_schema_digest,
+                "_note": "sha256(JCS(output_schema)) — same construction as "
+                         "args_digest and policy_version",
+            },
+        },
+        "typed_decision_fallback": {
+            "_about": (
+                "The same decider below its gate: the signed outcome is fallback, "
+                "so `chosen` records what the decider proposed, not what was enacted."
+            ),
+            "canonical_signing_input_sha256":
+                hashlib.sha256(signing_input(td_fallback_event)).hexdigest(),
+            "signed_event": td_fallback_event,
+            "annex": td_fallback_annex,
+            "expected_gate_label": "gate_consistent",
+        },
+        "typed_decision_resolution": {
+            "_about": (
+                "The superseding decision for the fallback: a different decider, no "
+                "gate, no scores, and parent_event_id naming the gated Event. A "
+                "fallback-gated decision with no superseding decision in a delivered "
+                "batch is reported as gate_unresolved (informational)."
+            ),
+            "canonical_signing_input_sha256":
+                hashlib.sha256(signing_input(td_resolve_event)).hexdigest(),
+            "signed_event": td_resolve_event,
+            "annex": td_resolve_annex,
+            "supersedes_event_id": EVT_TD_FALLBACK,
+        },
+        "decision_gate": {
+            "_about": (
+                "Fixtures for [TAP-EVT-GATE-DECIMAL]: exact decimal comparison, "
+                "never binary floating point. Every implementation MUST agree on "
+                "every row, including the boundary and the spelling cases."
+            ),
+            "outcomes": [{"score": a, "threshold": b, "outcome": c} for a, b, c in GATE_CASES],
+            "malformed": GATE_MALFORMED,
+        },
         "negative": negative,
         "tamper_check": "verify_event MUST reject when any signed field changes",
     }
@@ -925,11 +1250,13 @@ if __name__ == "__main__":
     print("\nPASSPORT (compact JWT):\n", passport)
     for label, ev in (("TOOL_CALL", tool_event), ("DECISION", dec_event),
                       ("CHECKPOINT", ckpt_event), ("CANONICALIZATION", canon_event),
-                      ("AUTHORIZATION", auth_event)):
+                      ("AUTHORIZATION", auth_event), ("TYPED_DECISION", td_accept_event),
+                      ("TYPED_DECISION_FALLBACK", td_fallback_event),
+                      ("TYPED_DECISION_RESOLUTION", td_resolve_event)):
         print(f"\n{label} canonical signing-input SHA-256:\n",
               hashlib.sha256(signing_input(ev)).hexdigest())
     print("\nCHECKPOINT event_id_root:\n", event_id_root)
     print(f"\nnegative cases: {len([k for k in negative if not k.startswith('_')])}")
     print("\nAll self-checks passed: passport ✓  tool_call ✓  decision ✓  checkpoint ✓  "
-          "canonicalization ✓  authorization ✓  omit-nulls ✓  guard ✓  suite ✓  "
+          "canonicalization ✓  authorization ✓  typed-decisions ✓  omit-nulls ✓  guard ✓  suite ✓  "
           "revocation ✓  negatives ✓")

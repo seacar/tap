@@ -4,6 +4,7 @@
  */
 export * from "./tap.js";
 export * from "./authority.js";
+export * from "./decider.js";
 export * from "./client.js";
 export * from "./instrumentMcp.js";
 export * from "./negotiate.js";

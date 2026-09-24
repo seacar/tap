@@ -50,6 +50,7 @@ from .negotiate import (
     seq_headers,
 )
 from .policy import PolicyDecision, PolicyRequest, evaluate as _evaluate_policy
+from .decider import Decider, DeciderError, build_gate
 # One buffered, fail-open reporter, shared with TAPServer. There were two
 # near-identical copies; the signer's had an unbounded flush() that spun forever
 # against an unreachable Verifier, and the fix only ever landed in one of them.
@@ -579,11 +580,24 @@ class TAPClient:
     def decision(self, *, question: str, options: list[dict], chosen: str,
                  scope_used: str | None = None, selection: str | None = None,
                  reasoning: str | None = None, decision_key: str = "decision",
-                 passport: Passport | None = None) -> dict:
+                 passport: Passport | None = None,
+                 decider: Decider | None = None, threshold: str | None = None,
+                 fallback_to: str | None = None, input: Any = None,
+                 model_output: str | None = None, parent_event_id: str | None = None,
+                 action_ref: str | None = None) -> dict:
         """Record a decision AND the alternatives not taken ([TAP-EVT-DECISION]).
 
         The signed body carries only digests; plaintext question and option
         rationale/reason go to the annex. Scores MUST be strings (§3.4).
+
+        Typed decisions (§6.4.1, provisional): pass ``decider`` to record which
+        model, rule, or human made the decision, and ``threshold`` to hold it to
+        a confidence gate. The gate's outcome is DERIVED from the chosen
+        option's score — a caller cannot record ``accept`` below its own
+        threshold. ``input`` (the decider's input) is committed as
+        ``action.args_digest`` with the plaintext in the annex. A decision that
+        supersedes a fallback passes the gated Event's id as ``parent_event_id``
+        and, ideally, its ``action_ref``.
         """
         p = self._require(passport)
         if chosen not in [o["id"] for o in options]:
@@ -627,14 +641,67 @@ class TAPClient:
         if selection:
             block["selection"] = selection
 
+        # Typed decisions [TAP-EVT-DECIDER, TAP-EVT-GATE, §6.4.1, provisional]
+        if threshold is not None and decider is None:
+            raise DeciderError("a gate needs a decider (§6.4.1)")
+        if decider is not None:
+            scored = any("score" in o for o in norm)
+            block["decider"] = decider.block(scored=scored)
+            if threshold is not None:
+                chosen_score = next(o.get("score") for o in norm if o["chosen"])
+                block["gate"] = build_gate(score=chosen_score, threshold=threshold,
+                                           decider_block=block["decider"],
+                                           fallback_to=fallback_to)
+
         # Plaintext question + option text → annex (erasable, §6.1.1)
         extra_annex: dict[str, Any] = {}
+        annex_decision: dict[str, Any] = {}
         if annex_options:
-            extra_annex["decision"] = {"question": question, "options": annex_options}
+            annex_decision = {"question": question, "options": annex_options}
+        if decider is not None and decider.output_schema is not None:
+            annex_decision.setdefault("question", question)
+            annex_decision["output_schema"] = decider.output_schema
+        if annex_decision:
+            extra_annex["decision"] = annex_decision
 
         return self._emit(p, kind="decision", intent=question, tool=decision_key,
                           scope_used=scope_used, reasoning=reasoning, decision=block,
+                          args=input, model_output=model_output,
+                          parent_event_id=parent_event_id, action_ref=action_ref,
                           extra_annex=extra_annex or None)
+
+    def typed_decision(self, *, question: str, labels: list[str], chosen: str,
+                       score: str, decider: Decider, threshold: str | None = None,
+                       fallback_to: str | None = None,
+                       scores: dict[str, str] | None = None, input: Any = None,
+                       model_output: str | None = None, decision_key: str = "decision",
+                       selection: str | None = "argmax", scope_used: str | None = None,
+                       action_ref: str | None = None, parent_event_id: str | None = None,
+                       passport: Passport | None = None) -> dict:
+        """Record one call to a typed decision model (§6.4.1, provisional).
+
+        A "System One" decider returns one label from a fixed set with a
+        probability. ``labels`` is that set (every label becomes an option, so
+        the counterfactual is complete); ``score`` is the chosen label's
+        probability as a gate decimal string, and ``scores`` optionally carries
+        the rest of the distribution. With ``threshold``, the returned Event's
+        ``decision.gate.outcome`` says whether the caller may act on ``chosen``
+        (``accept``) or must escalate (``fallback``) — check it before acting,
+        and record the superseding decision with ``parent_event_id`` set to this
+        Event's ``event_id``.
+        """
+        if chosen not in labels:
+            raise ValueError(f"chosen={chosen!r} not among labels")
+        dist = dict(scores or {})
+        dist[chosen] = score
+        options = [{"id": lab, **({"score": dist[lab]} if lab in dist else {})}
+                   for lab in labels]
+        return self.decision(question=question, options=options, chosen=chosen,
+                             scope_used=scope_used, selection=selection,
+                             decision_key=decision_key, passport=passport,
+                             decider=decider, threshold=threshold, fallback_to=fallback_to,
+                             input=input, model_output=model_output,
+                             parent_event_id=parent_event_id, action_ref=action_ref)
 
     def emit_checkpoint(self, passport: Passport | None = None) -> dict:
         """Emit a signed checkpoint event sealing the current record segment ([TAP-EVT-CHECKPOINT]).

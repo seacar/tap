@@ -14,6 +14,7 @@ import {
   signPassport,
   textDigest,
 } from "./tap.js";
+import { buildGate, DeciderError, deciderBlock, type Decider } from "./decider.js";
 import {
   authorizationHeaders,
   helloHeaders,
@@ -574,6 +575,13 @@ export class TAPClient {
    *
    * The signed body carries only digests; plaintext question and option
    * rationale/reason go to the annex. Scores MUST be strings (§3.4).
+   *
+   * Typed decisions (§6.4.1, provisional): `decider` records which model,
+   * rule, or human decided; `threshold` holds the decision to a confidence
+   * gate whose outcome is DERIVED from the chosen option's score. `input` is
+   * committed as `action.args_digest` with the plaintext in the annex. A
+   * decision superseding a fallback passes `parentEventId` (and ideally the
+   * gated Event's `actionRef`).
    */
   async decision(args: {
     question: string;
@@ -584,6 +592,13 @@ export class TAPClient {
     reasoning?: string;
     decisionKey?: string;
     passport?: Passport;
+    decider?: Decider;
+    threshold?: string;
+    fallbackTo?: string;
+    input?: unknown;
+    modelOutput?: string;
+    parentEventId?: string;
+    actionRef?: string;
   }): Promise<Record<string, unknown>> {
     if (!args.options.some((o) => o.id === args.chosen))
       throw new Error(`chosen=${args.chosen} not among options`);
@@ -624,10 +639,35 @@ export class TAPClient {
     };
     if (args.selection) decision.selection = args.selection;
 
-    const extraAnnex: Record<string, unknown> = {};
-    if (annexOptions.length > 0) {
-      extraAnnex.decision = { question: args.question, options: annexOptions };
+    // Typed decisions [TAP-EVT-DECIDER, TAP-EVT-GATE, §6.4.1, provisional]
+    if (args.threshold !== undefined && !args.decider) {
+      throw new DeciderError("a gate needs a decider (§6.4.1)");
     }
+    if (args.decider) {
+      const block = deciderBlock(args.decider, norm.some((o) => "score" in o));
+      decision.decider = block;
+      if (args.threshold !== undefined) {
+        const chosenScore = norm.find((o) => o.chosen === true)?.score as string | undefined;
+        decision.gate = buildGate({
+          score: chosenScore,
+          threshold: args.threshold,
+          deciderBlock: block,
+          fallbackTo: args.fallbackTo,
+        });
+      }
+    }
+
+    const extraAnnex: Record<string, unknown> = {};
+    const annexDecision: Record<string, unknown> = {};
+    if (annexOptions.length > 0) {
+      annexDecision.question = args.question;
+      annexDecision.options = annexOptions;
+    }
+    if (args.decider?.outputSchema !== undefined) {
+      annexDecision.question ??= args.question;
+      annexDecision.output_schema = args.decider.outputSchema;
+    }
+    if (Object.keys(annexDecision).length > 0) extraAnnex.decision = annexDecision;
 
     return this.emit({
       kind: "decision",
@@ -637,7 +677,60 @@ export class TAPClient {
       reasoning: args.reasoning,
       decision,
       passport: args.passport,
+      argsValue: args.input,
+      modelOutput: args.modelOutput,
+      parentEventId: args.parentEventId,
+      actionRef: args.actionRef,
       extraAnnex: Object.keys(extraAnnex).length > 0 ? extraAnnex : undefined,
+    });
+  }
+
+  /** Record one call to a typed decision model (§6.4.1, provisional).
+   *
+   * Every label becomes an option, so the counterfactual is complete. `score`
+   * is the chosen label's probability as a gate-decimal string; `scores`
+   * optionally carries the rest of the distribution. With `threshold`, check
+   * the returned Event's `decision.gate.outcome` before acting on `chosen`,
+   * and record the superseding decision with `parentEventId` on fallback.
+   */
+  async typedDecision(args: {
+    question: string;
+    labels: string[];
+    chosen: string;
+    score: string;
+    decider: Decider;
+    threshold?: string;
+    fallbackTo?: string;
+    scores?: Record<string, string>;
+    input?: unknown;
+    modelOutput?: string;
+    decisionKey?: string;
+    selection?: string | null;
+    scopeUsed?: string | null;
+    actionRef?: string;
+    parentEventId?: string;
+    passport?: Passport;
+  }): Promise<Record<string, unknown>> {
+    if (!args.labels.includes(args.chosen)) throw new Error(`chosen=${args.chosen} not among labels`);
+    const dist: Record<string, string> = { ...(args.scores ?? {}), [args.chosen]: args.score };
+    const options: DecisionOption[] = args.labels.map((id) =>
+      id in dist ? { id, score: dist[id] } : { id },
+    );
+    return this.decision({
+      question: args.question,
+      options,
+      chosen: args.chosen,
+      scopeUsed: args.scopeUsed,
+      selection: args.selection === null ? undefined : (args.selection ?? "argmax"),
+      decisionKey: args.decisionKey,
+      passport: args.passport,
+      decider: args.decider,
+      threshold: args.threshold,
+      fallbackTo: args.fallbackTo,
+      input: args.input,
+      modelOutput: args.modelOutput,
+      parentEventId: args.parentEventId,
+      actionRef: args.actionRef,
     });
   }
 

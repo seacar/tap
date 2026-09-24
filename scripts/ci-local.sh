@@ -57,6 +57,7 @@ run "handshake + nego binding"    python3 tests/test_handshake.py
 run "anti-downgrade (nego)"       python3 tests/test_nego.py
 run "policy engine"               python3 tests/test_policy.py
 run "authority binding (§9.2)"    python3 tests/test_authority.py
+run "typed decisions (§6.4.1)"    python3 tests/test_typed_decisions.py
 run "regressions (shipped once)"  python3 tests/test_regressions.py
 run "instance suffix"             python3 tests/test_instance_suffix.py
 run "core imports w/o network deps" \

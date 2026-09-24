@@ -16,6 +16,43 @@ A document patch release does **not** normally change signed bytes. **v0.1.2 is 
 
 ---
 
+## [0.1.7] — 2026-09-24
+
+Typed decisions (§6.4.1, **provisional**). **No signed bytes of any earlier record change.** Every existing vector case is byte-for-byte identical; `test-vectors.json` changes only `_spec_version` and gains new cases. The wire version stays `tap/0.1`, following the v0.1.3 precedent for strictly additive, omit-when-absent fields.
+
+**Why.** Agents increasingly send narrow decisions (classify, route, extract, approve-or-review) to components other than their main LLM: fast typed decision models that return one label from a fixed set with a calibrated probability (TypeSafe's Jev is the prompting example), compiled rules, and human reviewers. A v0.1.6 `decision` Event records what was chosen and what was rejected, but not which component chose, what output contract it was held to, or whether a low-confidence answer was acted on or escalated. For an auditor those are the questions that matter.
+
+### Added — specification
+
+- **`decision.decider`** `[TAP-EVT-DECIDER]`: `kind` (`model` | `rule` | `human`), `id`, `version`, OPTIONAL `version_digest`, `output_schema_digest` (sha256 over JCS of the typed output contract, whose plaintext goes in the annex as `decision.output_schema`), and `score_semantics` (`calibrated_probability` | `probability` | `uncalibrated`). The decider's input is committed by the existing `action.args_digest`, so no new field.
+- **`decision.gate`** `[TAP-EVT-GATE]`: `threshold`, `outcome` (`accept` | `fallback`), OPTIONAL `fallback_to`. `outcome` MUST be `accept` iff the chosen score ≥ threshold. On fallback, `chosen` is the decider's *proposal*; the superseding decision is a later `decision` Event whose `parent_event_id` names the gated one.
+- **`[TAP-EVT-GATE-DECIMAL]`**: gated scores and thresholds are decimals in [0, 1] with ≤ 6 places, compared exactly and never as floats. `"0.9"` equals `"0.90"`, and a score on the threshold is `accept`.
+- Verifier labels: `gate_consistent` / `gate_inconsistent` / `gate_unscorable` per Event, plus batch-level `gate_unresolved` (informational). §6.1.1 omit table, §6.6 vector table, §13 ("Decider claims") and §14 (provisional, out of the conformance table) updated.
+
+### Added — vectors and schemas
+
+- `typed_decision` (gate accepted), `typed_decision_fallback` (gate fell back), `typed_decision_resolution` (the superseding decision, different decider, `parent_event_id` set), and a `decision_gate` fixture table (boundary, spelling, and malformed cases). Decider ids are neutral examples (`example.com/…`); the contract names no vendor.
+- `negative.gate_outcome_inconsistent` (`expect: flag`): a validly signed Event whose gate says `accept` for 0.72 under a 0.90 threshold.
+- `schemas/event.schema.json`: `deciderBlock`, `gateBlock`, `gateDecimal`. `schemas/annex.schema.json`: `decision.output_schema`.
+
+### Added — implementations
+
+- **`tap_ref.py`**: `gate_decimal_micros`, `gate_outcome`, `decision_gate_label` as pure functions, plus self-checks.
+- **Python** `tap_sdk.decider`: `Decider`, `DeciderError`, `gate_outcome`, `decision_gate_label`, `check_output_schema`. `TAPClient.decision()` takes `decider=`, `threshold=`, `fallback_to=`, `input=`, `model_output=`, `parent_event_id=`, `action_ref=`. New `TAPClient.typed_decision()` records one typed-model call. The gate outcome is **derived**, never passed in. `evaluate_event` returns `decision_gate`, and `verify_transcript` returns `decision_gates: {inconsistent, unscorable, unresolved}`.
+- **TypeScript** `decider.ts`: the same surface (`typedDecision()`, `decisionGateLabel`, `checkOutputSchema`, `decision_gate` / `decision_gates`).
+- **Go** `decider.go`: `GateDecimalMicros`, `GateOutcome`, `DecisionGateLabel`, `UnresolvedFallbacks` (functions only, matching the rest of the Go SDK).
+- Tests: `test_typed_decisions.py`, `typedDecisions.test.ts`, `decider_test.go`. The envelope-parity emitters now cover the gated-accept, gated-fallback, and typed shapes, so the two SDKs are proven to compose identical typed-decision envelopes.
+- `docs/typed-decisions.md`: a guide with a worked Jev-style example.
+
+### Deliberately not done
+
+- A `gate_inconsistent` label is **reported but not folded into `verified`** while §6.4.1 is provisional, the same stance §9.2's signals take. It moves in once a production Signer emits gates.
+- No new `action.kind` and no new result code: a typed decision is a `decision`, and a fallback is a successful record of a decision that was not enacted.
+- The Inspector does not yet display decider or gate information.
+- `calibrated_probability` is the Signer's claim. Nothing here checks calibration, and nothing independently attests which hosted model answered. §13 names a provider-side server leg (§7) as the route to that.
+
+---
+
 ## [0.1.6] — 2026-09-08
 
 Packaging and tree-consistency release. **No signed bytes change.** Packages are not published to PyPI/npm in this step.

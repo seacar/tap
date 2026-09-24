@@ -22,6 +22,7 @@ import {
   type Jwk,
 } from "./tap.js";
 import { AuthorityRevoked, authorityEffectLabel, checkAuthorityNotRevoked } from "./authority.js";
+import { decisionGateLabel, unresolvedFallbacks, type GateLabel } from "./decider.js";
 
 /**
  * (authzId, authorityStateVersion) -> revoked_at (epoch seconds), or
@@ -72,6 +73,8 @@ export interface EventEvaluation {
   /** [TAP-AUTHORITY-REVOKE, §9.2, provisional] — always false unless a
    * `resolveAuthorityRevocation` was supplied and flagged this record. */
   authority_revoked: boolean;
+  /** [TAP-EVT-GATE, §6.4.1, provisional] — null when the Event carries no gate or its signature fails. */
+  decision_gate: GateLabel | null;
 }
 
 type Ev = Record<string, any>;
@@ -123,6 +126,7 @@ export async function evaluateEvent(
       authorization: null,
       authority_effect: null,
       authority_revoked: false,
+      decision_gate: null,
     };
   }
 
@@ -196,6 +200,8 @@ export async function evaluateEvent(
     authorization,
     authority_effect: authorityEffect,
     authority_revoked: authorityRevoked,
+    // [TAP-EVT-GATE, §6.4.1, provisional] — only meaningful once the signature checks out.
+    decision_gate: sigValid ? decisionGateLabel(event.decision) : null,
   };
 }
 
@@ -557,6 +563,10 @@ export async function verifyTranscript(
   // authzId -> the first sig-valid event_id it was seen on, for the
   // batch-local reuse scan below.
   const seenAuthz = new Map<string, string>();
+  // [TAP-EVT-GATE, §6.4.1, provisional]
+  const gateInconsistent: unknown[] = [];
+  const gateUnscorable: unknown[] = [];
+  const sigValidRegular: Ev[] = [];
 
   for (const ev of regular) {
     const res = await evaluateEvent(ev, {
@@ -565,8 +575,11 @@ export async function verifyTranscript(
       lastSeq,
       resolveAuthorityRevocation: opts.resolveAuthorityRevocation,
     });
+    if (res.decision_gate === "gate_inconsistent") gateInconsistent.push(res.event_id);
+    else if (res.decision_gate === "gate_unscorable") gateUnscorable.push(res.event_id);
     if (res.sig_valid) {
       validSig += 1;
+      sigValidRegular.push(ev);
       const ref = ev.action_ref as string | undefined;
       if (ref) {
         const list = actionGroups.get(ref) ?? [];
@@ -683,6 +696,12 @@ export async function verifyTranscript(
   if (authorityReuse.length) {
     parts.push(`${authorityReuse.length} authz_id reuse(s) detected.`);
   }
+  const gateUnresolved = unresolvedFallbacks(sigValidRegular);
+  if (gateInconsistent.length) {
+    parts.push(`${gateInconsistent.length} decision gate(s) contradict their own signed score [TAP-EVT-GATE].`);
+  }
+  if (gateUnscorable.length) parts.push(`${gateUnscorable.length} decision gate(s) could not be evaluated.`);
+  if (gateUnresolved.length) parts.push(`${gateUnresolved.length} fallback decision(s) not yet superseded.`);
   if (!pp.valid) parts.push(`Passport invalid (${pp.reason}).`);
 
   return {
@@ -695,6 +714,13 @@ export async function verifyTranscript(
     denials,
     authority_revoked: authorityRevoked,
     authority_reuse: authorityReuse,
+    // [TAP-EVT-GATE, §6.4.1, provisional] — reported, deliberately not folded
+    // into `verified` while §6.4.1 is provisional (the same stance as §9.2).
+    decision_gates: {
+      inconsistent: gateInconsistent,
+      unscorable: gateUnscorable,
+      unresolved: gateUnresolved,
+    },
     assurance: {
       by_action_ref: Object.fromEntries(assuranceByRef),
       nego_mismatches: negoMismatches,

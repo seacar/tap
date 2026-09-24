@@ -44,11 +44,19 @@ from .authority import (
     check_authority_window,
     check_authority_not_revoked,
 )
+from .decider import (
+    Decider,
+    DeciderError,
+    check_output_schema,
+    decision_gate_label,
+    gate_decimal_micros,
+    gate_outcome,
+)
 from .agent_id import resolve_agent_id
 from .signer import DelegationRejected, Passport, PolicyDenied, TAPClient
 from .tracer import TAPTracer, Tenant, TraceSession
 
-__version__ = "0.1.6"
+__version__ = "0.1.7"
 
 # `VerifierAPI` is the only part of this package that talks HTTP, and `httpx` is an
 # OPTIONAL dependency (`pip install traceable-agent-protocol[http]`). Importing it
@@ -96,4 +104,7 @@ __all__ = [
     "Authorization", "AuthorityError", "AuthorityExpired", "AuthorityRevoked",
     "authority_state_version", "check_authority_window", "check_authority_not_revoked",
     "authority_effect_label",
+    # typed decisions [TAP-EVT-DECIDER, TAP-EVT-GATE, §6.4.1, provisional]
+    "Decider", "DeciderError", "decision_gate_label", "gate_outcome",
+    "gate_decimal_micros", "check_output_schema",
 ]

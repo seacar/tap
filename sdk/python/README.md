@@ -52,6 +52,22 @@ tap.decision(
 
 The whole option set is inside the signature, so the agent can't later claim it weighed a different one. **Scores must be strings** — fractional numbers are forbidden in a signed body (spec §3.4) because float canonicalization is the most common source of cross-language signature divergence.
 
+### Typed decisions: who decided, and did it clear its gate (v0.1.7, provisional)
+
+```python
+from tap_sdk import Decider
+
+fast = Decider(kind="model", id="example.com/typed-decider", version="2026-09-15",
+               output_schema=ROUTE_SCHEMA, score_semantics="calibrated_probability")
+ev = tap.typed_decision(question="Route this invoice?", labels=["auto_approve", "manual_review"],
+                        chosen="auto_approve", score="0.72", decider=fast,
+                        threshold="0.90", fallback_to="llm", input=invoice)
+ev["decision"]["gate"]["outcome"]   # "fallback" — escalate, then record the superseding
+                                    # decision with parent_event_id=ev["event_id"]
+```
+
+The gate outcome is derived from the score, never passed in. See [docs/typed-decisions.md](../../docs/typed-decisions.md).
+
 ## Verify — with only a public key
 
 ```python
@@ -99,6 +115,7 @@ A denied action raises `PolicyDenied` *and* still records a signed `denied` even
 | `tap_sdk.verify` | Transcript verification, assurance labeling, chain reconstruction |
 | `tap_sdk.server` | `TAPServer` — the server-attested execution leg |
 | `tap_sdk.policy` | Policy evaluation and the `policy_decision` record |
+| `tap_sdk.decider` | Typed decisions: `Decider`, gate arithmetic, `decision_gate_label` (§6.4.1, provisional) |
 | `tap_sdk.tracer` | `TAPTracer` — high-level entry point; registers identities from an API key |
 | `tap_sdk.verifier_api` | Typed REST client for a Verifier (requires the `http` extra) |
 | `tap_sdk.transport` | Buffered, fail-open event reporter |

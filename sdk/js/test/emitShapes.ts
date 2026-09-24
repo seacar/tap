@@ -22,7 +22,7 @@ const VOLATILE = new Set([
   "event_id", "action_ref", "passport_jti", "aid", "cid", "ts", "sig",
   "intent_digest", "args_digest", "reasoning_digest", "model_output_digest",
   "question_digest", "rationale_digest", "reason_digest", "options_digest",
-  "event_id_root", "kid",
+  "event_id_root", "kid", "parent_event_id",
 ]);
 
 function normalize(value: unknown, key?: string): unknown {
@@ -59,13 +59,47 @@ await tap.decision({
     { id: "deny", score: "0.10", reason: "would breach policy" },
   ],
 });
+// typed decisions (§6.4.1, provisional): gate accepted, gate fell back, and the
+// superseding decision — must match sdk/python/tests/emit_shapes.py exactly.
+const schema = { type: "object", properties: { label: { enum: ["approve", "review"] } } };
+const fast = {
+  kind: "model" as const, id: "example.com/typed-decider", version: "2026-09-15",
+  outputSchema: schema, scoreSemantics: "calibrated_probability" as const,
+};
+await tap.typedDecision({
+  question: "Route?", labels: ["approve", "review"], chosen: "approve",
+  score: "0.97", scores: { review: "0.03" }, decider: fast, threshold: "0.90",
+  input: { invoice: "INV-1" },
+});
+const fb = await tap.typedDecision({
+  question: "Route?", labels: ["approve", "review"], chosen: "approve",
+  score: "0.72", decider: fast, threshold: "0.90", fallbackTo: "llm",
+  input: { invoice: "INV-2" },
+});
+await tap.decision({
+  question: "Route?", chosen: "review", input: { invoice: "INV-2" },
+  options: [
+    { id: "approve", reason: "no PO match" },
+    { id: "review", rationale: "unusual total" },
+  ],
+  decider: { kind: "model", id: "example.com/frontier-llm", version: "2026-06-01", outputSchema: schema },
+  parentEventId: fb.event_id as string, actionRef: fb.action_ref as string,
+});
 await tap.recordOutput({ output: "done" });
 await tap.emitCheckpoint();
 await tap.flush();
 
 // Sorted top-level keys so the two languages' JSON is directly comparable as text.
 const byKind = new Map<string, unknown>();
-for (const ev of captured) byKind.set(ev.action.kind, normalize(ev));
+// One key per distinct envelope shape — typed decisions split by gate outcome.
+const shapeKey = (ev: Record<string, any>): string => {
+  let key = ev.action.kind as string;
+  const d = ev.decision ?? {};
+  if ("gate" in d) key += ":gated-" + d.gate.outcome;
+  else if ("decider" in d) key += ":typed";
+  return key;
+};
+for (const ev of captured) byKind.set(shapeKey(ev), normalize(ev));
 const shapes: Record<string, unknown> = {};
 for (const kind of [...byKind.keys()].sort()) shapes[kind] = byKind.get(kind);
 process.stdout.write(JSON.stringify(shapes, null, 2) + "\n");

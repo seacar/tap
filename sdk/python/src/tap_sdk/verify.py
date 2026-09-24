@@ -29,6 +29,7 @@ from .policy import (
     policy_version,
 )
 from .authority import AuthorityRevoked, authority_effect_label, check_authority_not_revoked
+from .decider import decision_gate_label, unresolved_fallbacks
 
 # kid -> public JWK dict
 KeyResolver = Callable[[str], dict | None]
@@ -109,6 +110,7 @@ def evaluate_event(
             "authorization": None,
             "authority_effect": None,
             "authority_revoked": False,
+            "decision_gate": None,
         }
 
     # Drift: scope_used ⊆ passport.scope ([TAP-SCOPE-MATCH]). Only meaningful once the
@@ -163,6 +165,11 @@ def evaluate_event(
             except AuthorityRevoked:
                 authority_revoked = True
 
+    # Typed decisions [TAP-EVT-GATE, §6.4.1, provisional]: does the signed gate
+    # outcome agree with the signed score and threshold? Only meaningful once
+    # the signature checks out. Reported alongside, never in place of, the rest.
+    decision_gate = decision_gate_label(event.get("decision")) if sig_valid else None
+
     return {
         "event_id": event.get("event_id"),
         "sig_valid": sig_valid,
@@ -174,6 +181,7 @@ def evaluate_event(
         "authorization": authorization,
         "authority_effect": authority_effect,
         "authority_revoked": authority_revoked,
+        "decision_gate": decision_gate,
     }
 
 
@@ -525,6 +533,10 @@ def verify_transcript(
     duplicates: list[int] = []
     authority_revoked: list[dict] = []
     authority_reuse: list[dict] = []
+    # [TAP-EVT-GATE, §6.4.1, provisional]
+    gate_inconsistent: list[str] = []
+    gate_unscorable: list[str] = []
+    sig_valid_regular: list[dict] = []
     # authz_id -> the first sig-valid event_id it was seen on, for the
     # batch-local reuse scan below [TAP-AUTHORITY-REUSE, §9.2, provisional].
     seen_authz: dict[str, str] = {}
@@ -538,8 +550,13 @@ def verify_transcript(
             ev, resolve_key=resolve_key, passport_claims=claims, last_seq=last_seq,
             resolve_authority_revocation=resolve_authority_revocation,
         )
+        if res["decision_gate"] == "gate_inconsistent":
+            gate_inconsistent.append(res["event_id"])
+        elif res["decision_gate"] == "gate_unscorable":
+            gate_unscorable.append(res["event_id"])
         if res["sig_valid"]:
             valid_sig += 1
+            sig_valid_regular.append(ev)
             ref = ev.get("action_ref")
             if ref:
                 action_groups.setdefault(ref, []).append(ev)
@@ -649,6 +666,14 @@ def verify_transcript(
         parts.append(f"{len(authority_revoked)} event(s) named a revoked authority binding.")
     if authority_reuse:
         parts.append(f"{len(authority_reuse)} authz_id reuse(s) detected.")
+    gate_unresolved = unresolved_fallbacks(sig_valid_regular)
+    if gate_inconsistent:
+        parts.append(f"{len(gate_inconsistent)} decision gate(s) contradict their own "
+                     f"signed score [TAP-EVT-GATE].")
+    if gate_unscorable:
+        parts.append(f"{len(gate_unscorable)} decision gate(s) could not be evaluated.")
+    if gate_unresolved:
+        parts.append(f"{len(gate_unresolved)} fallback decision(s) not yet superseded.")
     if not pp["valid"]:
         parts.append(f"Passport invalid ({pp.get('reason')}).")
 
@@ -664,6 +689,13 @@ def verify_transcript(
         # [TAP-AUTHORITY-REVOKE / TAP-AUTHORITY-REUSE, §9.2, provisional].
         "authority_revoked": authority_revoked,
         "authority_reuse": authority_reuse,
+        # [TAP-EVT-GATE, §6.4.1, provisional] — reported, and deliberately NOT
+        # folded into `verified` while §6.4.1 is provisional (the same stance
+        # §9.2's signals take); the spec moves it in once a production Signer
+        # emits gates.
+        "decision_gates": {"inconsistent": gate_inconsistent,
+                           "unscorable": gate_unscorable,
+                           "unresolved": gate_unresolved},
         "summary": " ".join(parts),
     }
 
