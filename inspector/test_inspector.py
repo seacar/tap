@@ -147,6 +147,53 @@ def test_authority_revocation_is_surfaced_via_a_supplied_resolver() -> None:
     assert "REVOKED" in rendered
 
 
+def test_typed_decisions_are_surfaced_read_only() -> None:
+    """[TAP-EVT-DECIDER / TAP-EVT-GATE, §6.4.1, provisional]: the Inspector shows
+    which component decided, the gate it was held to, and the label
+    evaluate_event derived — and flags a fallback nothing has superseded yet."""
+    vectors = json.loads((REPO / "test-vectors.json").read_text(encoding="utf-8"))
+    accepted = vectors["typed_decision"]["signed_event"]
+    fallback = vectors["typed_decision_fallback"]["signed_event"]
+    resolution = vectors["typed_decision_resolution"]["signed_event"]
+    resolve_key = {k["kid"]: k for k in vectors["jwks"]["keys"]}.get
+
+    from tap_sdk import verify as V
+
+    # The fallback alone: its superseding decision hasn't arrived.
+    record = core.build_record_from_local(
+        passport_claims=None, events=[fallback], resolve_key=resolve_key,
+    )
+    ev = record["events"][0]
+    assert ev["sig_valid"], record
+    assert ev["decision_gate"] == vectors["typed_decision_fallback"]["expected_gate_label"]
+    assert record["flags"]["gate_unresolved"] == [fallback["event_id"]]
+    rendered = core.render_chain_ascii(V.annotate_assurance(record))
+    assert "decider=model:example.com/typed-decider@" in rendered
+    assert "gate=fallback->llm@0.90" in rendered
+
+    # With the superseding decision delivered, nothing is unresolved.
+    record = core.build_record_from_local(
+        passport_claims=None, events=[fallback, resolution], resolve_key=resolve_key,
+    )
+    assert record["flags"]["gate_unresolved"] == []
+    rendered = core.render_chain_ascii(V.annotate_assurance(record))
+    assert f"supersedes={fallback['event_id']}" in rendered
+
+    record = core.build_record_from_local(
+        passport_claims=None, events=[accepted], resolve_key=resolve_key,
+    )
+    assert record["events"][0]["decision_gate"] == vectors["typed_decision"]["expected_gate_label"]
+
+    # A validly signed but inconsistent gate is labeled, not hidden.
+    neg = vectors["negative"]["gate_outcome_inconsistent"]
+    record = core.build_record_from_local(
+        passport_claims=None, events=[neg["event"]],
+        resolve_key={neg["jwk"]["kid"]: neg["jwk"]}.get,
+    )
+    assert record["events"][0]["decision_gate"] == "gate_inconsistent"
+    assert "decision_gate=gate_inconsistent" in core.render_chain_ascii(V.annotate_assurance(record))
+
+
 def main() -> None:
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     print(f"1..{len(tests)}")

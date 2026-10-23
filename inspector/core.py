@@ -21,6 +21,7 @@ from typing import Callable
 import httpx
 
 from tap_sdk.core import DEFAULT_TTL_S, load_signer, public_jwk
+from tap_sdk.decider import unresolved_fallbacks
 from tap_sdk.signer import Passport, TAPClient
 import tap_sdk.verify as V
 
@@ -207,6 +208,9 @@ def build_record_from_local(*, passport_claims: dict | None, events: list[dict],
             # enforcement, just a read of what evaluate_event already computed.
             "authorization": res["authorization"], "authority_effect": res["authority_effect"],
             "authority_revoked": res["authority_revoked"],
+            # [TAP-EVT-DECIDER / TAP-EVT-GATE, §6.4.1, provisional] — likewise
+            # display-only: the label evaluate_event already derived.
+            "decision_gate": res["decision_gate"],
         })
         if isinstance(ev.get("seq"), int):
             last_seq_by_attestor[attestor] = ev["seq"]
@@ -220,6 +224,9 @@ def build_record_from_local(*, passport_claims: dict | None, events: list[dict],
             "drift": any(r["drift"] for r in stored),
             "invalid_sig": any(not r["sig_valid"] for r in stored),
             "integrity": [r["integrity"] for r in stored if r["integrity"]],
+            # Informational, like verify_transcript's own `gate_unresolved`: the
+            # superseding decision may simply not have arrived yet.
+            "gate_unresolved": unresolved_fallbacks([r["raw"] for r in stored if r["sig_valid"]]),
         },
     }
 
@@ -254,6 +261,20 @@ def _render_record_lines(record: dict) -> str:
                 f" authz={authorization.get('authz_id')} "
                 f"authority_effect={rec.get('authority_effect')}{revoked}"
             )
+        # [TAP-EVT-DECIDER / TAP-EVT-GATE, §6.4.1, provisional] — display-only.
+        decision = raw.get("decision") or {}
+        decider = decision.get("decider")
+        if isinstance(decider, dict):
+            line += f" decider={decider.get('kind')}:{decider.get('id')}@{decider.get('version')}"
+        gate = decision.get("gate")
+        if isinstance(gate, dict):
+            to = f"->{gate['fallback_to']}" if gate.get("fallback_to") else ""
+            line += (
+                f" gate={gate.get('outcome')}{to}@{gate.get('threshold')} "
+                f"decision_gate={rec.get('decision_gate')}"
+            )
+        if action.get("kind") == "decision" and raw.get("parent_event_id"):
+            line += f" supersedes={raw['parent_event_id']}"
         lines.append(line)
     return "\n".join(lines)
 

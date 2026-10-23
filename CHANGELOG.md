@@ -16,6 +16,21 @@ A document patch release does **not** normally change signed bytes. **v0.1.2 is 
 
 ---
 
+## [Unreleased]
+
+**No signed bytes change.**
+
+### Added
+
+- **Inspector: typed decisions (§6.4.1, provisional).** `build_record_from_local` carries each Event's `decision_gate` label and a record-level `flags.gate_unresolved` (fallback-gated decisions nothing has superseded yet). `render_chain_ascii`, and so the CLI and web UI, shows `decider=<kind>:<id>@<version>`, `gate=<outcome>[-><fallback_to>]@<threshold>`, the gate label, and `supersedes=<parent_event_id>` on a superseding decision. Display-only, like the authority fields. Covered by a new test in `inspector/test_inspector.py` against the `typed_decision*` vectors and `negative.gate_outcome_inconsistent`.
+
+### Changed
+
+- `sdk/python/pyproject.toml`: the `dev` extra now includes `uvicorn`, so `pip install -e ".[dev]"` is enough to run `scripts/ci-local.sh`.
+- `outstanding-tasks.md` re-audited against v0.1.7: every item the 2026-09-08 review raised is closed except the Go tracing client.
+
+---
+
 ## [0.1.7] — 2026-09-24
 
 Typed decisions (§6.4.1, **provisional**). **No signed bytes of any earlier record change.** Every existing vector case is byte-for-byte identical; `test-vectors.json` changes only `_spec_version` and gains new cases. The wire version stays `tap/0.1`, following the v0.1.3 precedent for strictly additive, omit-when-absent fields.

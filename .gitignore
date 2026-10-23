@@ -34,3 +34,6 @@ Thumbs.db
 # It enumerates unshipped work and known weaknesses; that belongs in private
 # notes, not in the public standard.
 TAP-TODO.md
+
+# Local code-index cache (graft)
+graft/
